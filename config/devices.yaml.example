@@ -1,0 +1,36 @@
+# Copy to devices.yaml and list every Cisco router to monitor.
+# Any value can reference an environment variable from .env: ${NAME} or ${NAME:-default}
+
+defaults:                         # applied to every device unless overridden
+  device_type: cisco_ios          # cisco_ios (classic IOS) or cisco_xe (IOS-XE)
+  port: 22
+  username: ${CISCO_USERNAME}
+  password: ${CISCO_PASSWORD}
+  secret: ${CISCO_ENABLE_SECRET}  # enable secret; leave empty if the user lands at privilege 15
+  interface: GigabitEthernet0/0   # the WAN / internet-facing interface to watch
+  vrf:                            # set if G0/0 sits in a VRF (e.g. INTERNET); blank = global table
+  ping_targets: [8.8.8.8, 1.1.1.1]   # internet is "up" if ANY target answers
+
+devices:
+  - name: rtr-hq-01
+    host: 10.10.0.1
+
+  - name: rtr-branch-sby
+    host: 10.20.0.1
+    device_type: cisco_xe
+
+  - name: rtr-branch-mdn
+    host: 10.30.0.1
+    interface: GigabitEthernet0/0/0   # ISR 4000-series naming
+    vrf: INTERNET
+
+  - name: rtr-dc-01
+    host: 10.40.0.1
+    expected_subnet: 203.0.113.0/29   # optional: pin the subnet. Alerts if G0/0 is ever outside it.
+                                      # Without this, the first subnet seen is learned as the baseline.
+
+  - name: rtr-old-lab
+    host: 10.99.0.1
+    username: ${LAB_USERNAME:-admin}  # per-device credentials override the defaults
+    password: ${LAB_PASSWORD}
+    enabled: false                    # keep in inventory but don't check

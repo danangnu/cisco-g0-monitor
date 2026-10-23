@@ -1,0 +1,22 @@
+services:
+  cisco-g0-monitor:
+    build: .
+    image: cisco-g0-monitor:1.0.0
+    container_name: cisco-g0-monitor
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets TRACKIT_DB_HOST=host.docker.internal reach MariaDB on this machine
+    environment:
+      TZ: Australia/Perth   # alert timestamps use this zone (e.g. Asia/Jakarta, Asia/Makassar)
+    volumes:
+      - ./config:/config:ro
+      - monitor-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  monitor-data:

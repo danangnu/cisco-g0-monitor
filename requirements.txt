@@ -1,0 +1,7 @@
+netmiko==4.4.0
+# Pinned: paramiko 5.x dropped the SHA1 key-exchange and ssh-rsa host keys that
+# Cisco IOS 15.x routers use, which fails with "no acceptable kex algorithm".
+paramiko==3.5.1
+PyYAML==6.0.2
+requests==2.32.3
+PyMySQL==1.1.1

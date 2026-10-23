@@ -1,0 +1,53 @@
+# Copy to settings.yaml. Secrets come from .env via ${VAR}.
+
+interval_seconds: 300        # how often every device is checked
+max_workers: 10              # devices checked in parallel
+ssh_timeout: 20
+state_dir: /data             # state.json, events.jsonl, heartbeat (Docker volume)
+log_level: INFO
+
+ping:
+  count: 5                   # pings per target, sourced from the monitored interface
+  timeout: 2                 # seconds per ping
+  min_success_percent: 60    # >= this on any target = internet OK
+
+thresholds:
+  failure: 2                 # consecutive failed checks before alerting (avoids flapping alerts)
+  recovery: 2                # consecutive good checks before sending "restored"
+
+alerts:
+  on_ip_change_same_subnet: false   # true = also alert when the IP changes but the subnet is the same
+  on_device_unreachable: true       # alert when SSH to the router fails
+  send_recovery: true               # send "restored" messages
+  repeat_every_minutes: 60          # reminder while still down; 0 = never repeat
+
+notify:
+  # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
+  # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.
+  trackit:
+    enabled: true
+    db_host: ${TRACKIT_DB_HOST}
+    db_port: ${TRACKIT_DB_PORT:-3306}
+    db_user: ${TRACKIT_DB_USER}
+    db_password: ${TRACKIT_DB_PASSWORD}
+    db_name: ${TRACKIT_DB_NAME:-trackitlive}
+    to: ${CISCO_ALERT_RECIPIENT}           # comma-separated; one logbulkmail row per recipient
+    from: ${CISCO_ALERT_FROM}              # logbulkmail.spoofas (blank = recipient, like Teltonika)
+    from_name: Cisco G0/0 Monitor          # logbulkmail.spoofname
+    priority: 1
+
+  email:                                   # direct SMTP - off; TrackIT handles email
+    enabled: false
+    host: ${SMTP_HOST}
+    port: ${SMTP_PORT:-587}
+    security: ${SMTP_SECURITY:-starttls}   # starttls | ssl | none
+    username: ${SMTP_USERNAME}
+    password: ${SMTP_PASSWORD}
+    from: ${ALERT_EMAIL_FROM}
+    to: ${ALERT_EMAIL_TO}                  # comma-separated list
+  teams:
+    enabled: true
+    webhook_url: ${TEAMS_WEBHOOK_URL}      # Teams Workflows "Post to a channel when a webhook request is received"
+  slack:
+    enabled: false
+    webhook_url: ${SLACK_WEBHOOK_URL}

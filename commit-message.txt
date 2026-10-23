@@ -1,0 +1,10 @@
+feat: add Cisco G0/0 internet and subnet-change monitor
+
+- Check G0/0 status, IP/subnet and internet ping sourced from G0/0 over SSH
+- Alert on internet down/restored, subnet change, address loss and SSH failure
+- Queue alert emails in TrackIT logbulkmail like the Teltonika SMS Console
+- Retry TrackIT inserts from a local outbox when the database is unavailable
+- Support Microsoft Teams, Slack and direct SMTP as optional channels
+- Pin paramiko 3.5.1 for legacy Cisco IOS SSH key exchange
+- Package as a Docker container with healthcheck and persistent state
+- Add parser, state machine, TrackIT and end-to-end tests
