@@ -11,6 +11,8 @@ import requests
 
 from .trackit import TrackitQueue
 
+CONF_COLOR = {"high": "#107c10", "medium": "#ca5010", "low": "#8a8886"}
+
 log = logging.getLogger(__name__)
 
 ICON = {"critical": "🔴", "warning": "🟠", "info": "🔵", "ok": "🟢"}
@@ -34,7 +36,7 @@ class Notifier:
     def channels(self) -> list[str]:
         return [name for name in ("trackit", "email", "teams", "slack") if self.cfg.get(name, {}).get("enabled")]
 
-    def send(self, events: list) -> None:
+    def send(self, events: list, diagnosis=None) -> None:
         events = [e for e in events if e.notify]
         if not events:
             # Nothing new, but retry any TrackIT reports left over from a DB outage.
@@ -48,8 +50,8 @@ class Notifier:
         events = sorted(events, key=lambda e: (order.get(e.severity, 9), e.device))
         for name in self.channels():
             try:
-                getattr(self, f"_send_{name}")(events)
-                log.info("Sent %d event(s) via %s", len(events), name)
+                getattr(self, f"_send_{name}")(events, diagnosis)
+                log.info("Sent %d event(s) via %s%s", len(events), name, " with AI diagnosis" if diagnosis else "")
             except Exception as e:  # noqa: BLE001 - one channel failing must not block others
                 if name == "trackit":
                     # Reports stay in the outbox and are retried next cycle; no traceback spam.
@@ -59,11 +61,11 @@ class Notifier:
                     log.exception("Failed to send alerts via %s", name)
 
     # ---- TrackIT logbulkmail (same path the Teltonika SMS Console uses) -----
-    def _send_trackit(self, events: list) -> None:
-        self.trackit.send(events)
+    def _send_trackit(self, events: list, diagnosis=None) -> None:
+        self.trackit.send(events, diagnosis)
 
     # ---- email (direct SMTP) -------------------------------------------------
-    def _send_email(self, events: list) -> None:
+    def _send_email(self, events: list, diagnosis=None) -> None:
         c = self.cfg["email"]
         if not c.get("host") or not c.get("to"):
             raise ValueError("email.host and email.to are required")
@@ -76,6 +78,8 @@ class Notifier:
             f"[{e.severity.upper()}] {e.title}\n  Device: {e.device} ({e.host})\n  {e.detail}\n  Time: {e.timestamp}"
             for e in events
         )
+        if diagnosis:
+            text = diagnosis.as_text() + "\n\n" + "-" * 40 + "\n\n" + text
         msg.set_content(text)
 
         rows = "".join(
@@ -87,6 +91,7 @@ class Notifier:
         )
         msg.add_alternative(
             f"<html><body style='font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
+            f"{diagnosis_html(diagnosis)}"
             f"<table cellspacing='0' cellpadding='0' style='border-collapse:separate;border-spacing:0 8px'>{rows}</table>"
             f"<p style='color:#888;font-size:12px'>Sent by cisco-g0-monitor</p></body></html>",
             subtype="html",
@@ -107,12 +112,21 @@ class Notifier:
             server.send_message(msg)
 
     # ---- Microsoft Teams (Workflows / Power Automate webhook) ---------------
-    def _send_teams(self, events: list) -> None:
+    def _send_teams(self, events: list, diagnosis=None) -> None:
         url = self.cfg["teams"].get("webhook_url")
         if not url:
             raise ValueError("teams.webhook_url is required")
         body = [{"type": "TextBlock", "size": "Medium", "weight": "Bolder", "wrap": True,
                  "text": _subject(events).replace(PREFIX, "").strip()}]
+        if diagnosis:
+            body.append({"type": "Container", "style": "emphasis", "items": [
+                {"type": "TextBlock", "wrap": True, "weight": "Bolder",
+                 "text": f"🤖 AI diagnosis ({diagnosis.confidence} confidence, {diagnosis.scope.replace('_', ' ')})"},
+                {"type": "TextBlock", "wrap": True, "text": diagnosis.summary},
+                {"type": "TextBlock", "wrap": True, "text": f"**Likely cause:** {diagnosis.likely_cause}"},
+                {"type": "TextBlock", "wrap": True, "text": "**Recommended:**\n" + "\n".join(
+                    f"{i}. {a}" for i, a in enumerate(diagnosis.recommended_actions, 1))},
+            ]})
         for e in events:
             body.append({"type": "Container", "separator": True, "items": [
                 {"type": "TextBlock", "wrap": True, "weight": "Bolder",
@@ -130,12 +144,42 @@ class Notifier:
         resp.raise_for_status()
 
     # ---- Slack (incoming webhook) -------------------------------------------
-    def _send_slack(self, events: list) -> None:
+    def _send_slack(self, events: list, diagnosis=None) -> None:
         url = self.cfg["slack"].get("webhook_url")
         if not url:
             raise ValueError("slack.webhook_url is required")
         lines = [f"*{_subject(events)}*"]
+        if diagnosis:
+            lines.append(f":robot_face: *AI diagnosis* ({diagnosis.confidence} confidence, {diagnosis.scope.replace('_', ' ')})\n"
+                         f"{diagnosis.summary}\n*Likely cause:* {diagnosis.likely_cause}\n*Recommended:*\n"
+                         + "\n".join(f"{i}. {a}" for i, a in enumerate(diagnosis.recommended_actions, 1)))
         for e in events:
             lines.append(f"{ICON.get(e.severity, '')} *{e.title}*\n`{e.device}` ({e.host}) · {e.timestamp}\n{e.detail}")
         resp = requests.post(url, json={"text": "\n\n".join(lines)}, timeout=self.timeout)
         resp.raise_for_status()
+
+
+def diagnosis_html(diagnosis) -> str:
+    """Shared HTML block for the AI diagnosis (SMTP and TrackIT emails)."""
+    if not diagnosis:
+        return ""
+    esc = html.escape
+    color = CONF_COLOR.get(diagnosis.confidence, "#8a8886")
+    evidence = "".join(f"<li>{esc(x)}</li>" for x in diagnosis.evidence)
+    actions = "".join(f"<li>{esc(x)}</li>" for x in diagnosis.recommended_actions)
+    per_dev = "".join(f"<li><b>{esc(str(d.get('device', '')))}</b>: {esc(str(d.get('finding', '')))}</li>"
+                      for d in diagnosis.per_device)
+    return (
+        f"<div style='border:1px solid #ddd;border-left:5px solid {color};padding:10px 14px;margin:0 0 14px 0;"
+        f"background:#fafafa;font-family:Segoe UI,Arial,sans-serif;font-size:14px'>"
+        f"<div style='font-weight:bold;margin-bottom:6px'>AI diagnosis "
+        f"<span style='font-weight:normal;color:#555'>({esc(diagnosis.confidence)} confidence, "
+        f"scope: {esc(diagnosis.scope.replace('_', ' '))})</span></div>"
+        f"<p style='margin:0 0 8px 0'>{esc(diagnosis.summary)}</p>"
+        f"<p style='margin:0 0 8px 0'><b>Likely cause:</b> {esc(diagnosis.likely_cause)}</p>"
+        + (f"<b>Evidence</b><ul style='margin:4px 0 8px 0'>{evidence}</ul>" if evidence else "")
+        + (f"<b>Recommended actions</b><ol style='margin:4px 0 8px 0'>{actions}</ol>" if actions else "")
+        + (f"<b>Per device</b><ul style='margin:4px 0 0 0'>{per_dev}</ul>" if per_dev else "")
+        + f"<div style='color:#888;font-size:11px;margin-top:8px'>Generated by {esc(diagnosis.model)} from read-only "
+          f"router diagnostics. Verify before acting.</div></div>"
+    )

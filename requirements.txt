@@ -5,3 +5,4 @@ paramiko==3.5.1
 PyYAML==6.0.2
 requests==2.32.3
 PyMySQL==1.1.1
+anthropic==2.3.0

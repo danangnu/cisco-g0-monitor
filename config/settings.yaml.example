@@ -21,6 +21,17 @@ alerts:
   send_recovery: true               # send "restored" messages
   repeat_every_minutes: 60          # reminder while still down; 0 = never repeat
 
+# Stage 1 AI agent: when an alert fires, log in to the affected routers, run a fixed
+# READ-ONLY command set (show / ping / traceroute), and ask Claude for a diagnosis that
+# is put at the top of the alert. Alerts are still sent if this fails or is disabled.
+ai:
+  enabled: true
+  api_key: ${ANTHROPIC_API_KEY}
+  model: claude-sonnet-5-5         # claude-haiku-5-5 is cheaper/faster; claude-opus-5-5 is stronger
+  max_per_hour: 6                  # cap on API calls per hour (a flapping link can't run up a bill)
+  diagnose_reminders: false        # also diagnose the hourly "still down" reminders
+  timeout_seconds: 90
+
 notify:
   # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
   # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.

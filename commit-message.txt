@@ -1,10 +1,10 @@
-feat: add Cisco G0/0 internet and subnet-change monitor
+feat: add AI diagnosis of alerts (agent stage 1)
 
-- Check G0/0 status, IP/subnet and internet ping sourced from G0/0 over SSH
-- Alert on internet down/restored, subnet change, address loss and SSH failure
-- Queue alert emails in TrackIT logbulkmail like the Teltonika SMS Console
-- Retry TrackIT inserts from a local outbox when the database is unavailable
-- Support Microsoft Teams, Slack and direct SMTP as optional channels
-- Pin paramiko 3.5.1 for legacy Cisco IOS SSH key exchange
-- Package as a Docker container with healthcheck and persistent state
-- Add parser, state machine, TrackIT and end-to-end tests
+- Run a fixed read-only command set on affected routers when an alert fires
+- Redact secrets from router output before analysis
+- Ask Claude once per alerting cycle for a structured fleet-level diagnosis
+- Put summary, likely cause, evidence and actions at the top of every alert
+- Cap API calls per hour and always fall back to a plain alert on failure
+- Record each diagnosis with its raw diagnostics in /data/diagnoses.jsonl
+- Add --diagnose DEVICE for on-demand diagnosis
+- Release version 1.1.0

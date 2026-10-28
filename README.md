@@ -1,6 +1,6 @@
 # cisco-g0-monitor
 
-Watches every Cisco IOS / IOS-XE router in your inventory and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
+Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
 
 | Event | Severity | When |
 |---|---|---|
@@ -42,6 +42,54 @@ docker compose exec cisco-g0-monitor python -m monitor.main --status   # status 
 ```
 
 The first cycle learns each router's G0/0 subnet as its baseline (no alert). From then on, changes are alerted.
+
+## AI diagnosis (Stage 1 of the agent)
+
+When an alert fires, the monitor investigates before it emails you:
+
+1. Logs back in to each affected router and runs a **fixed, read-only** command set
+   (`show version | include uptime`, `show ip interface`, `show interfaces`, `show ip route 0.0.0.0`,
+   `show dhcp lease`, `show ip arp`, ping to the learned default gateway and to 8.8.8.8 / google.com
+   sourced from G0/0, a short `traceroute`, and the last 40 lines of `show logging`).
+   Nothing in `monitor/diagnose.py` can change configuration; the allow-list is asserted at import time.
+2. Redacts anything that looks like a password, secret, key or SNMP community.
+3. Sends the whole cycle (the alerts, every router's latest check incl. the healthy ones, and the
+   diagnostics) to Claude **once** and asks for a structured diagnosis.
+4. Puts the diagnosis at the top of the TrackIT email / Teams card / Slack message:
+   summary, likely cause, evidence quoted from the router output, recommended actions, confidence.
+
+Example:
+
+> **AI diagnosis** (high confidence, scope: upstream)
+> All four routers lost internet at once; their G0/0 links are up but the upstream modem at 192.168.1.1 does not answer.
+> **Likely cause:** Upstream modem / ISP outage
+> **Recommended actions:** 1. Power-cycle the modem at 192.168.1.1  2. If still down after 5 min, call the ISP
+
+Settings (`config/settings.yaml` → `ai:`), key in `.env` as `ANTHROPIC_API_KEY`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Turn the whole feature off with `false` |
+| `model` | `claude-sonnet-5-5` | `claude-haiku-5-5` is cheaper, `claude-opus-5-5` stronger |
+| `max_per_hour` | `6` | Hard cap on API calls; beyond it alerts go out without a diagnosis |
+| `diagnose_reminders` | `false` | Also diagnose the hourly "still down" reminders |
+| `timeout_seconds` | `90` | API timeout; the alert is sent without diagnosis if exceeded |
+
+Guarantees: the alert is **always** sent, with or without a diagnosis - API errors, missing key, SSH failures
+during diagnostics and the hourly cap all degrade to a plain alert. Diagnosis only runs for
+`INTERNET_DOWN`, `SUBNET_CHANGED`, `SUBNET_MISMATCH`, `ADDRESS_LOST` and `DEVICE_UNREACHABLE`;
+nothing is sent to the API while everything is healthy. Each diagnosis (with the raw diagnostics) is
+appended to `/data/diagnoses.jsonl` for later review.
+
+Cost: a diagnosis is roughly 5-15k input tokens and ~300 output tokens, i.e. a few cents on Sonnet.
+
+Try it without waiting for an outage:
+
+```bash
+docker compose run --rm cisco-g0-monitor --diagnose rtr-143          # one router
+docker compose run --rm cisco-g0-monitor --diagnose rtr-143,rtr-145  # some
+docker compose run --rm cisco-g0-monitor --diagnose all              # whole fleet, one diagnosis
+```
 
 ## How email is sent (TrackIT, same as Teltonika)
 
@@ -128,8 +176,9 @@ monitor/
   engine.py      state machine: thresholds, baselines, events (pure logic, unit-tested)
   notifier.py    dispatch to TrackIT / SMTP / Teams / Slack
   trackit.py     TrackIT logbulkmail queue (+ retry outbox)
+  diagnose.py    Stage 1 AI: read-only diagnostics + Claude diagnosis
   state.py       state.json, events.jsonl, heartbeat
-  main.py        loop + CLI (--once, --check, --status, --test-alert)
+  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose)
   healthcheck.py Docker HEALTHCHECK
 tests/           pytest suite with simulated IOS / IOS-XE output
 ```

@@ -191,8 +191,9 @@ class CaptureNotifier:
     def __init__(self):
         self.sent = []
 
-    def send(self, events):
+    def send(self, events, diagnosis=None):
         self.sent.extend(e for e in events if e.notify)
+        self.diagnosis = diagnosis
 
 
 def test_end_to_end_cycle(tmp_path):
@@ -303,3 +304,270 @@ def test_trackit_outage_keeps_reports_then_retries(tmp_path):
     state["up"] = True
     q.flush()
     assert q.pending() == 0 and len(db.rows) == 1
+
+
+# ---------------- Stage 1: AI diagnosis ----------------
+import copy  # noqa: E402
+import json  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from monitor import diagnose  # noqa: E402
+from monitor.diagnose import (Budget, Diagnosis, READ_ONLY_COMMANDS, build_messages,  # noqa: E402
+                              collect, diagnose_cycle, redact, wants_diagnosis)
+from monitor.notifier import diagnosis_html  # noqa: E402
+
+AI_SETTINGS = copy.deepcopy(DEFAULT_SETTINGS)
+AI_SETTINGS["ai"].update(enabled=True, api_key="sk-test", model="claude-test")
+
+
+def test_command_set_is_read_only():
+    for _, cmd in READ_ONLY_COMMANDS:
+        assert cmd.split()[0] in ("show", "ping", "traceroute"), cmd
+        assert not any(w in cmd for w in ("configure", "write", "reload", "clear", "debug", "copy"))
+
+
+def test_redact_secrets():
+    txt = ("username admin privilege 15 secret 5 $1$abc\nenable password cisco123\n"
+           "snmp-server community public RO\ncrypto isakmp key MyPSK address 1.2.3.4\nGigabitEthernet0/0 is up")
+    out = redact(txt)
+    assert "cisco123" not in out and "$1$abc" not in out and "public" not in out and "MyPSK" not in out
+    assert "GigabitEthernet0/0 is up" in out
+
+
+class DiagRouter:
+    """Fake router that answers the diagnostic command set."""
+    def __init__(self, gw_ok=True, inet_ok=True, uptime="2 weeks, 3 days", errors=0):
+        self.cmds = []
+        self.gw_ok, self.inet_ok, self.uptime, self.errors = gw_ok, inet_ok, uptime, errors
+
+    def send_command(self, cmd, read_timeout=None):
+        self.cmds.append(cmd)
+        if cmd.startswith("show version"):
+            return f"rtr uptime is {self.uptime}\nSystem returned to ROM by power-on"
+        if cmd.startswith("show ip interface"):
+            return SHOW_DHCP
+        if cmd.startswith("show interfaces"):
+            return f"GigabitEthernet0/0 is up, line protocol is up\n  {self.errors} input errors, {self.errors} CRC"
+        if cmd.startswith("show ip route"):   # real IOS output for a DHCP-installed default route
+            return ("Routing entry for 0.0.0.0/0, supernet\n  Known via \"static\", distance 254, metric 0, candidate default path\n"
+                    "  Routing Descriptor Blocks:\n  * 192.168.1.1\n      Route metric is 0, traffic share count is 1")
+        if cmd.startswith("show dhcp lease"):
+            return "Temp IP addr: 100.64.12.34  for peer on Interface: GigabitEthernet0/0\n  Lease: 86400 secs"
+        if cmd.startswith("show ip arp"):
+            return "Internet  192.168.1.1   5   aabb.cc00.0100  ARPA   GigabitEthernet0/0"
+        if cmd.startswith("ping 192.168.1.1"):
+            return PING_OK if self.gw_ok else PING_FAIL
+        if cmd.startswith("ping"):
+            return PING_OK if self.inet_ok else PING_FAIL
+        if cmd.startswith("traceroute"):
+            return "  1 192.168.1.1 2 msec\n  2 * \n  3 * " if not self.inet_ok else "  1 192.168.1.1 1 msec\n  2 10.0.0.1 5 msec"
+        if cmd.startswith("show logging"):
+            return "\n".join(f"line {i}" for i in range(100)) + "\n%LINK-3-UPDOWN: Interface GigabitEthernet0/0, changed state to up\nenable secret 5 $1$zzz"
+        return "% Invalid input"
+
+    def disconnect(self):
+        pass
+
+
+def test_collect_runs_commands_learns_gateway_and_redacts():
+    r = DiagRouter()
+    dd = collect([DEV], AI_SETTINGS, connect=lambda d, t: r, probe=lambda h, p: True)[DEV.name]
+    assert dd.collected and dd.gateway == "192.168.1.1"
+    assert "ping 192.168.1.1 source GigabitEthernet0/0 repeat 5 timeout 1" in r.cmds
+    assert all(c.split()[0] in ("show", "ping", "traceroute") for c in r.cmds)
+    assert "$1$zzz" not in dd.outputs["log_tail"]["output"]
+    assert dd.outputs["log_tail"]["output"].count("\n") <= 40
+    assert dd.tcp_port_open is None  # only probed when SSH fails
+
+
+def test_collect_unreachable_device_gets_tcp_probe():
+    def boom(d, t):
+        raise TimeoutError("TCP connection to device failed")
+    dd = collect([DEV], AI_SETTINGS, connect=boom, probe=lambda h, p: False)[DEV.name]
+    assert not dd.collected and dd.tcp_port_open is False and "TimeoutError" in dd.error
+
+
+def test_budget_caps_calls_per_hour(tmp_path):
+    b = Budget(str(tmp_path), max_per_hour=2)
+    assert b.allow(1000) and b.allow(1001) and not b.allow(1002)
+    assert b.allow(1000 + 3601)  # window rolled
+
+
+def test_wants_diagnosis_filters_kinds():
+    evs = [ev(kind="INTERNET_DOWN"), ev(kind="INTERNET_RESTORED", sev="ok"), ev(kind="BASELINE_LEARNED", sev="info"),
+           ev(kind="INTERNET_STILL_DOWN")]
+    assert [e.kind for e in wants_diagnosis(evs, {})] == ["INTERNET_DOWN"]
+    assert [e.kind for e in wants_diagnosis(evs, {"diagnose_reminders": True})] == ["INTERNET_DOWN", "INTERNET_STILL_DOWN"]
+
+
+class FakeClaude:
+    """Stands in for anthropic.Anthropic; returns a fixed report_diagnosis tool call."""
+    def __init__(self, answer=None, fail=False):
+        self.calls, self.fail = [], fail
+        self.answer = answer or {
+            "summary": "All four routers lost internet at once; their G0/0 links are up but the upstream modem at 192.168.1.1 does not answer.",
+            "scope": "upstream", "likely_cause": "Upstream modem / ISP outage",
+            "evidence": ["ping 192.168.1.1 from G0/0: 0% on every router", "G0/0 up/up, 0 input errors"],
+            "recommended_actions": ["Power-cycle the modem at 192.168.1.1", "If still down after 5 min, call the ISP"],
+            "confidence": "high", "per_device": [{"device": "rtr-143", "finding": "link up, gateway unreachable"}],
+        }
+        self.messages = self
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        if self.fail:
+            raise RuntimeError("API down")
+        return SimpleNamespace(content=[SimpleNamespace(type="tool_use", input=self.answer)],
+                               model=kw["model"], usage=SimpleNamespace(input_tokens=1200, output_tokens=180))
+
+
+def test_end_to_end_cycle_with_ai_diagnosis(tmp_path):
+    hosts = [f"192.168.18.{n}" for n in (143, 145, 147, 149)]
+    routers = {h: {"show": SHOW_DHCP, "ping": PING_OK, "commands": []} for h in hosts}
+    diag_routers = {h: DiagRouter(gw_ok=False, inet_ok=False) for h in hosts}
+    mode = {"diag": False}
+
+    def connect(device, timeout):
+        # The monitor's own check talks to FakeConn; once alerts fire, the diagnostics
+        # connections (which run after all checks) talk to the richer DiagRouter.
+        return diag_routers[device.host] if mode["diag"] else FakeConn(routers[device.host])
+
+    devs = [Device(**{**DEV.__dict__, "name": f"rtr-{h.rsplit('.', 1)[1]}", "host": h}) for h in hosts]
+    store, notifier, claude = StateStore(str(tmp_path)), CaptureNotifier(), FakeClaude()
+    clock = iter(T0 + timedelta(minutes=5 * i) for i in range(10))
+
+    def cycle():
+        checks = {"n": 0}
+        def routed(device, timeout):
+            checks["n"] += 1
+            mode["diag"] = checks["n"] > len(devs)   # first 4 connections are the checks
+            return connect(device, timeout)
+        run_cycle(devs, AI_SETTINGS, store, notifier, connect=routed, now_fn=lambda: next(clock), ai_client=claude)
+
+    cycle()                                       # baseline, healthy -> no API call
+    assert claude.calls == [] and notifier.diagnosis is None
+    for r in routers.values():
+        r["ping"] = PING_FAIL
+    cycle()                                       # 1st failure: below threshold -> no API call
+    assert claude.calls == []
+    cycle()                                       # 2nd failure: INTERNET_DOWN x4 -> diagnostics + one API call
+
+    assert len(claude.calls) == 1
+    kw = claude.calls[0]
+    assert kw["tool_choice"] == {"type": "auto"} and kw["tools"][0]["name"] == "report_diagnosis"
+    payload = json.loads(kw["messages"][0]["content"].split("(JSON):\n\n", 1)[1].rsplit("\n\nDiagnose", 1)[0])
+    assert {a["kind"] for a in payload["alerts"]} == {"INTERNET_DOWN"} and len(payload["alerts"]) == 4
+    assert all("diagnostics" in r for r in payload["routers"])
+    assert payload["routers"][0]["diagnostics"]["default_gateway"] == "192.168.1.1"
+    assert payload["routers"][0]["diagnostics"]["commands"]["ping_gateway"]["output"].startswith("Type escape")
+
+    d = notifier.diagnosis
+    assert isinstance(d, Diagnosis) and d.scope == "upstream" and d.confidence == "high"
+    assert d.input_tokens == 1200 and d.model == "claude-test"
+    assert "Power-cycle the modem" in d.as_text()
+    html_block = diagnosis_html(d)
+    assert "AI diagnosis" in html_block and "Power-cycle the modem at 192.168.1.1" in html_block
+    assert len((tmp_path / "diagnoses.jsonl").read_text().splitlines()) == 1
+    assert (tmp_path / "ai_usage.json").exists()
+    assert [e.kind for e in notifier.sent] == ["INTERNET_DOWN"] * 4
+
+
+def test_api_failure_still_sends_alert(tmp_path):
+    claude = FakeClaude(fail=True)
+    evs = [ev()]
+    d = diagnose_cycle(evs, [DEV], {DEV.name: res(ok=False)}, {}, AI_SETTINGS, str(tmp_path), T0,
+                       connect=lambda dv, t: DiagRouter(), client=claude, probe=lambda h, p: True)
+    assert d is None and len(claude.calls) == 1
+
+
+def test_disabled_or_no_key_skips_quietly(tmp_path):
+    off = copy.deepcopy(AI_SETTINGS); off["ai"]["enabled"] = False
+    assert diagnose_cycle([ev()], [DEV], {}, {}, off, str(tmp_path), T0) is None
+    nokey = copy.deepcopy(AI_SETTINGS); nokey["ai"]["api_key"] = ""
+    import os
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+    assert diagnose_cycle([ev()], [DEV], {}, {}, nokey, str(tmp_path), T0) is None
+
+
+def test_trackit_report_includes_diagnosis():
+    claude = FakeClaude()
+    d = diagnose.ask_claude([{"role": "user", "content": "x"}], AI_SETTINGS["ai"], client=claude)
+    report = build_report([ev()], "a@x.com", d)
+    assert "AI diagnosis" in report["body"] and "Upstream modem" in report["body"]
+    assert build_report([ev()], "a@x.com", d)["subject"] == build_report([ev()], "a@x.com")["subject"]
+
+
+def test_real_sdk_request_and_response_shape():
+    """Drive the real anthropic SDK against a mock HTTP transport to validate the wire format."""
+    import anthropic
+    try:
+        import httpx2 as httpx   # anthropic >= 2.x
+    except ImportError:
+        import httpx
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "claude-test",
+            "stop_reason": "tool_use", "stop_sequence": None,
+            "usage": {"input_tokens": 900, "output_tokens": 120},
+            "content": [{"type": "tool_use", "id": "tu_1", "name": "report_diagnosis",
+                         "input": FakeClaude().answer}],
+        })
+
+    client = anthropic.Anthropic(api_key="sk-test", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    d = diagnose.ask_claude(build_messages([ev()], [DEV], {}, {}, {}, T0), AI_SETTINGS["ai"], client=client)
+    assert seen["url"].endswith("/v1/messages")
+    b = seen["body"]
+    assert b["model"] == "claude-test" and b["tool_choice"] == {"type": "auto"}
+    assert b["tools"][0]["name"] == "report_diagnosis" and "senior network engineer" in b["system"]
+    assert d.scope == "upstream" and d.input_tokens == 900 and d.model == "claude-test"
+
+
+def test_cmd_diagnose_all_runs_fleet_in_one_call(tmp_path, monkeypatch, capsys):
+    from monitor import main as main_mod
+    hosts = [f"192.168.18.{n}" for n in (143, 145, 147, 149)]
+    devs = [Device(**{**DEV.__dict__, "name": f"rtr-{h.rsplit('.', 1)[1]}", "host": h}) for h in hosts]
+    claude = FakeClaude()
+    monkeypatch.setattr(main_mod, "check_device", lambda d, s: res(ok=d.host != hosts[1]))
+    monkeypatch.setattr("monitor.diagnose._default_connect", lambda d, t: DiagRouter())
+    monkeypatch.setattr("monitor.diagnose._default_client", lambda cfg: claude)
+    import monitor.diagnose as dg
+    monkeypatch.setattr(dg, "tcp_probe", lambda h, p: True)
+    assert main_mod.cmd_diagnose("all", devs, AI_SETTINGS, StateStore(str(tmp_path))) == 0
+    assert len(claude.calls) == 1
+    payload = json.loads(claude.calls[0]["messages"][0]["content"].split("(JSON):\n\n", 1)[1].rsplit("\n\nDiagnose", 1)[0])
+    kinds = {a["device"]: a["kind"] for a in payload["alerts"]}
+    assert kinds == {"rtr-143": "MANUAL_CHECK", "rtr-145": "INTERNET_DOWN", "rtr-147": "MANUAL_CHECK", "rtr-149": "MANUAL_CHECK"}
+    assert all("diagnostics" in r for r in payload["routers"])
+    out = capsys.readouterr().out
+    assert "Checking 4 router(s)" in out and "AI DIAGNOSIS" in out
+    assert main_mod.cmd_diagnose("rtr-999", devs, AI_SETTINGS, StateStore(str(tmp_path))) == 1
+
+
+def test_find_gateway_from_real_ios_outputs():
+    from monitor.diagnose import find_gateway
+    route_dhcp = ("Routing entry for 0.0.0.0/0, supernet\n  Known via \"static\", distance 254, metric 0, candidate default path\n"
+                  "  Routing Descriptor Blocks:\n  * 192.168.1.1\n      Route metric is 0, traffic share count is 1\n")
+    route_via = "S*    0.0.0.0/0 [1/0] via 203.0.113.1\n"
+    lease = ("Temp IP addr: 192.168.1.104  for peer on Interface: GigabitEthernet0/0\n"
+             "   DHCP Lease server: 192.168.1.1, state: 5 Bound\nTemp default-gateway addr: 192.168.1.1\n")
+    assert find_gateway(route_dhcp) == "192.168.1.1"
+    assert find_gateway(route_via) == "203.0.113.1"
+    assert find_gateway(lease) == "192.168.1.1"
+    assert find_gateway("% Network not in table") is None
+
+
+def test_parse_response_falls_back_to_json_text_and_prose():
+    from monitor.diagnose import parse_response
+    tool = SimpleNamespace(content=[SimpleNamespace(type="tool_use", input={"summary": "s", "scope": "upstream"})])
+    assert parse_response(tool)["scope"] == "upstream"
+    jtext = SimpleNamespace(content=[SimpleNamespace(type="text", text='Here you go:\n{"summary": "modem down", "scope": "upstream", "confidence": "high"}')])
+    assert parse_response(jtext)["summary"] == "modem down"
+    prose = SimpleNamespace(content=[SimpleNamespace(type="text", text="The modem looks dead.")])
+    d = parse_response(prose)
+    assert d["summary"] == "The modem looks dead." and d["confidence"] == "low"
+    with pytest.raises(ValueError):
+        parse_response(SimpleNamespace(content=[]))

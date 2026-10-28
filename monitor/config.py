@@ -26,6 +26,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "send_recovery": True,
         "repeat_every_minutes": 60,
     },
+    "ai": {
+        "enabled": False,
+        "api_key": "",                       # or ANTHROPIC_API_KEY in the environment
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 1500,
+        "timeout_seconds": 90,
+        "max_per_hour": 6,                   # hard cap on API calls; alerts still go out without diagnosis
+        "diagnose_reminders": False,         # also diagnose hourly STILL_DOWN reminders
+        "collect_timeout_seconds": 120,
+    },
     "notify": {
         "trackit": {"enabled": False, "db_host": "", "db_port": 3306, "db_user": "", "db_password": "",
                     "db_name": "trackitlive", "to": [], "from": "", "from_name": "Cisco G0/0 Monitor",

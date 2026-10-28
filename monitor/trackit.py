@@ -35,7 +35,7 @@ def _split(value) -> list[str]:
     return [str(v).strip() for v in (value or []) if str(v).strip()]
 
 
-def build_report(events: list, recipient: str) -> dict:
+def build_report(events: list, recipient: str, diagnosis=None) -> dict:
     if not events:
         raise ValueError("At least one event is required for a report.")
 
@@ -66,7 +66,10 @@ def build_report(events: list, recipient: str) -> dict:
         for e in events
     )
     n = len(events)
+    from .notifier import diagnosis_html  # local import: notifier imports this module
+
     body = f"""
+    {diagnosis_html(diagnosis)}
     <p>The Cisco G0/0 Monitor detected {n} event{'' if n == 1 else 's'} on {len(devices)} router{'' if len(devices) == 1 else 's'}.</p>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse">
       <thead>
@@ -171,12 +174,12 @@ class TrackitQueue:
         return len(self._load_outbox())
 
     # ---- public --------------------------------------------------------------
-    def send(self, events: list) -> None:
+    def send(self, events: list, diagnosis=None) -> None:
         if not self.recipients:
             raise ValueError("notify.trackit.to (CISCO_ALERT_RECIPIENT) is required")
         outbox = self._load_outbox()
         if events:
-            outbox += [build_report(events, r) for r in self.recipients]
+            outbox += [build_report(events, r, diagnosis) for r in self.recipients]
         self._save_outbox(outbox)
         self.flush()
 

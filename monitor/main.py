@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from .collector import _default_connect, check_device
+from .diagnose import diagnose_cycle
 from .config import load_devices, load_settings
 from .engine import INFO, Event, evaluate
 from .notifier import Notifier
@@ -31,7 +32,7 @@ _stop = threading.Event()
 
 
 def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=_default_connect,
-              now_fn=lambda: datetime.now().astimezone()) -> list:
+              now_fn=lambda: datetime.now().astimezone(), ai_client=None) -> list:
     active = [d for d in devices if d.enabled]
     states = store.load()
     results = {}
@@ -61,10 +62,83 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
                 "EVENT %s: %s - %s", e.kind, e.title, e.detail)
 
     store.save(new_states)  # devices removed from inventory drop out of state here
+
+    # Stage 1 AI: investigate alert-worthy events before notifying (never blocks the alert on failure)
+    diagnosis = diagnose_cycle(all_events, active, results, new_states, settings, store.dir, now,
+                               connect=connect, client=ai_client)
+
     store.append_events(all_events)
-    notifier.send(all_events)
+    notifier.send(all_events, diagnosis)
     store.heartbeat()
     return all_events
+
+
+def cmd_diagnose(target: str, devices, settings, store: StateStore) -> int:
+    """On-demand diagnosis: `--diagnose rtr-143`, `--diagnose rtr-143,rtr-145` or `--diagnose all`.
+
+    Checks the chosen routers, collects the read-only diagnostics on all of them in parallel,
+    and asks Claude ONCE for a fleet-level assessment - the same path a real alert takes.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .diagnose import ask_claude, build_messages, collect
+
+    enabled = [d for d in devices if d.enabled]
+    if target.strip().lower() == "all":
+        chosen = enabled
+    else:
+        names = [n.strip() for n in target.split(",") if n.strip()]
+        unknown = [n for n in names if n not in {d.name for d in devices}]
+        if unknown:
+            print(f"Unknown device(s): {', '.join(unknown)}. Known: {', '.join(d.name for d in devices)}")
+            return 1
+        chosen = [d for d in devices if d.name in names]
+    if not settings.get("ai", {}).get("enabled"):
+        print("ai.enabled is false in settings.yaml")
+        return 1
+
+    now = datetime.now().astimezone()
+    print(f"Checking {len(chosen)} router(s): {', '.join(d.name for d in chosen)}")
+    with ThreadPoolExecutor(max_workers=max(1, int(settings["max_workers"]))) as pool:
+        results = dict(zip([d.name for d in chosen], pool.map(lambda d: check_device(d, settings), chosen)))
+    for d in chosen:
+        r = results[d.name]
+        print(f"  {d.name:16} {d.interface}={r.ip or '-':20} internet_ok={r.internet_ok} reachable={r.reachable} {r.error or ''}")
+
+    print(f"Collecting read-only diagnostics on {len(chosen)} router(s) in parallel (30-90s)...")
+    diags = collect(chosen, settings)
+    for d in chosen:
+        dd = diags[d.name]
+        if dd.collected:
+            print(f"  {d.name:16} {len(dd.outputs)} commands, gateway={dd.gateway or '?'}, {dd.seconds}s")
+        else:
+            print(f"  {d.name:16} diagnostics FAILED: {dd.error} (tcp port open: {dd.tcp_port_open})")
+
+    events = []
+    for d in chosen:
+        r = results[d.name]
+        if not r.reachable:
+            kind, sev, detail = "DEVICE_UNREACHABLE", "critical", r.error or "SSH failed"
+        elif r.internet_ok is False:
+            kind, sev, detail = "INTERNET_DOWN", "critical", r.reason or "ping failed"
+        else:
+            kind, sev, detail = "MANUAL_CHECK", "info", ("No problem detected by the monitor; assess this router's "
+                                                        "WAN link health and anything worth watching.")
+        title = f"{'Manual diagnosis requested for' if kind == 'MANUAL_CHECK' else kind + ' on'} {d.name}"
+        events.append(Event(d.name, d.host, kind, sev, title, detail, now.isoformat(timespec="seconds")))
+
+    msgs = build_messages(events, devices, results, store.load(), diags, now)
+    print(f"Asking {settings['ai']['model']} for one fleet-level diagnosis...")
+    try:
+        diag = ask_claude(msgs, settings["ai"])
+    except Exception as e:  # noqa: BLE001
+        print(f"\nClaude request failed: {type(e).__name__}: {e}")
+        print("During live monitoring this would be logged and the alert sent without a diagnosis.")
+        return 2
+    print()
+    print(diag.as_text())
+    print(f"\n[{diag.model}: {diag.input_tokens} in / {diag.output_tokens} out tokens, {diag.seconds}s]")
+    return 0
 
 
 def print_status(store: StateStore) -> None:
@@ -95,6 +169,7 @@ def main(argv=None) -> int:
     g.add_argument("--check", metavar="DEVICE", help="check one device and print the raw result")
     g.add_argument("--status", action="store_true", help="print last known status and exit")
     g.add_argument("--test-alert", action="store_true", help="send a test alert and exit")
+    g.add_argument("--diagnose", metavar="DEVICE|all", help="read-only diagnostics + AI diagnosis now: a name, a comma-separated list, or all")
     args = p.parse_args(argv)
 
     settings = load_settings(args.settings)
@@ -105,6 +180,8 @@ def main(argv=None) -> int:
     debug = str(settings["log_level"]).upper() == "DEBUG"
     logging.getLogger("paramiko").setLevel(logging.DEBUG if debug else logging.CRITICAL)
     logging.getLogger("netmiko").setLevel(logging.WARNING)
+    for noisy in ("anthropic", "httpx", "httpx2", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     store = StateStore(settings["state_dir"])
     notifier = Notifier(settings["notify"], state_dir=settings["state_dir"])
@@ -123,6 +200,9 @@ def main(argv=None) -> int:
         return 0
 
     devices = load_devices(args.devices)
+
+    if args.diagnose:
+        return cmd_diagnose(args.diagnose, devices, settings, store)
 
     if args.check:
         dev = next((d for d in devices if d.name == args.check), None)
