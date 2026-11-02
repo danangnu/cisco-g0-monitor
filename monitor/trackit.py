@@ -87,6 +87,15 @@ def build_report(events: list, recipient: str, diagnosis=None) -> dict:
     return {"recipient": recipient, "subject": subject, "body": body, "marker": marker}
 
 
+def build_custom_report(subject: str, body_html: str, recipient: str) -> dict:
+    """A report that is not built from events (e.g. the weekly summary). Idempotent on subject + recipient."""
+    report_id = hashlib.sha256(f"{subject}|{recipient}".encode()).hexdigest()[:10].upper()
+    marker = f"{MARKER_PREFIX}-{report_id}"
+    subject = subject.encode("latin-1", "replace").decode("latin-1")[:180]
+    body = (body_html + f"\n<!-- {marker} -->").encode("ascii", "xmlcharrefreplace").decode("ascii")
+    return {"recipient": recipient, "subject": subject, "body": body, "marker": marker}
+
+
 def persist_report(conn, report: dict, from_address: str, from_name: str, priority: int) -> str:
     """Insert one report into logbulkmail. Returns 'inserted' or 'reused'."""
     try:
@@ -181,6 +190,12 @@ class TrackitQueue:
         if events:
             outbox += [build_report(events, r, diagnosis) for r in self.recipients]
         self._save_outbox(outbox)
+        self.flush()
+
+    def send_custom(self, subject: str, body_html: str) -> None:
+        if not self.recipients:
+            raise ValueError("notify.trackit.to (CISCO_ALERT_RECIPIENT) is required")
+        self._save_outbox(self._load_outbox() + [build_custom_report(subject, body_html, r) for r in self.recipients])
         self.flush()
 
     def flush(self) -> None:

@@ -32,6 +32,30 @@ ai:
   diagnose_reminders: false        # also diagnose the hourly "still down" reminders
   timeout_seconds: 90
 
+# Stage 2: memory and trends. Everything below is stored in /data/history.db (SQLite).
+history:
+  retention_days: 90               # checks/events older than this are pruned (latest config is always kept)
+
+trends:                            # warnings raised from history before a link actually fails
+  enabled: true
+  latency_ratio: 2.0               # 24h median latency >= 2x the previous week's median ...
+  latency_min_increase_ms: 20      # ... and at least 20 ms higher -> LATENCY_DEGRADED
+  loss_threshold_percent: 90       # 24h average ping success below this while "up" -> PACKET_LOSS
+  flap_incidents_24h: 3            # this many outages in 24h -> FLAPPING
+  repeat_hours: 24                 # each warning at most once per device per day
+
+backup:                            # daily `show running-config`, redacted, diffed against the previous one
+  enabled: true
+  hour: 3                          # local time; runs in the first cycle after this hour
+  warn_on_change: true             # CONFIG_CHANGED alerts (with the diff) when a config differs
+
+report:                            # weekly summary: uptime, outages, latency, config changes per router
+  enabled: true
+  weekday: 0                       # 0 = Monday
+  hour: 8
+  days: 7
+  use_ai: true                     # one Claude call per week for the narrative on top of the table
+
 notify:
   # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
   # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.

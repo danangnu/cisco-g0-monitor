@@ -6,6 +6,10 @@ Usage:
   python -m monitor.main --check rtr-01  # debug one device, print raw result, no state/alerts
   python -m monitor.main --status        # print last known status table
   python -m monitor.main --test-alert    # send a test message to every enabled channel
+  python -m monitor.main --diagnose all  # read-only diagnostics + AI diagnosis now
+  python -m monitor.main --history all   # incident history, uptime, latency trend
+  python -m monitor.main --backup        # back up running-configs now, report diffs
+  python -m monitor.main --report        # send the weekly report now
 """
 from __future__ import annotations
 
@@ -20,8 +24,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from . import backup, report, trends
 from .collector import _default_connect, check_device
 from .diagnose import diagnose_cycle
+from .history import History
 from .config import load_devices, load_settings
 from .engine import INFO, Event, evaluate
 from .notifier import Notifier
@@ -32,8 +38,9 @@ _stop = threading.Event()
 
 
 def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=_default_connect,
-              now_fn=lambda: datetime.now().astimezone(), ai_client=None) -> list:
+              now_fn=lambda: datetime.now().astimezone(), ai_client=None, hist: History = None) -> list:
     active = [d for d in devices if d.enabled]
+    hist = hist or History(os.path.join(store.dir, "history.db"))
     states = store.load()
     results = {}
     with ThreadPoolExecutor(max_workers=max(1, int(settings["max_workers"]))) as pool:
@@ -63,12 +70,38 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
 
     store.save(new_states)  # devices removed from inventory drop out of state here
 
+    # Stage 2: trend warnings from history (latency creeping up, packet loss, flapping)
+    try:
+        all_events += trends.detect(hist, active, new_states, settings, now)
+    except Exception:  # noqa: BLE001
+        log.exception("Trend detection failed")
+
+    # Stage 2: daily config backup (runs inside the cycle after the configured hour, once per day)
+    if backup.is_due(hist, settings, now):
+        try:
+            all_events += backup.run(active, settings, hist, now, connect=connect)
+        except Exception:  # noqa: BLE001
+            log.exception("Config backup failed")
+
     # Stage 1 AI: investigate alert-worthy events before notifying (never blocks the alert on failure)
     diagnosis = diagnose_cycle(all_events, active, results, new_states, settings, store.dir, now,
-                               connect=connect, client=ai_client)
+                               connect=connect, client=ai_client, history=hist)
 
     store.append_events(all_events)
+    try:
+        hist.record_cycle(results, all_events, now, diagnosis)
+    except Exception:  # noqa: BLE001
+        log.exception("Could not write history")
     notifier.send(all_events, diagnosis)
+
+    # Stage 2: weekly report
+    if report.is_due(hist, settings, now):
+        try:
+            report.run(hist, active, settings, now, notifier, client=ai_client)
+        except Exception:  # noqa: BLE001
+            log.exception("Weekly report failed")
+    if now.hour == 4 and now.minute < 10:
+        hist.prune(now, int(settings.get("history", {}).get("retention_days", 90)))
     store.heartbeat()
     return all_events
 
@@ -127,8 +160,10 @@ def cmd_diagnose(target: str, devices, settings, store: StateStore) -> int:
         title = f"{'Manual diagnosis requested for' if kind == 'MANUAL_CHECK' else kind + ' on'} {d.name}"
         events.append(Event(d.name, d.host, kind, sev, title, detail, now.isoformat(timespec="seconds")))
 
-    msgs = build_messages(events, devices, results, store.load(), diags, now)
-    print(f"Asking {settings['ai']['model']} for one fleet-level diagnosis...")
+    hist = History(os.path.join(store.dir, "history.db"))
+    hist_ctx = {d.name: hist.summary_for(d.name, now, 30) for d in devices}
+    msgs = build_messages(events, devices, results, store.load(), diags, now, hist_ctx)
+    print(f"Asking {settings['ai']['model']} for one fleet-level diagnosis (with {len(hist_ctx)} routers' history)...")
     try:
         diag = ask_claude(msgs, settings["ai"])
     except Exception as e:  # noqa: BLE001
@@ -138,6 +173,27 @@ def cmd_diagnose(target: str, devices, settings, store: StateStore) -> int:
     print()
     print(diag.as_text())
     print(f"\n[{diag.model}: {diag.input_tokens} in / {diag.output_tokens} out tokens, {diag.seconds}s]")
+    return 0
+
+
+def cmd_history(target: str, devices, store: StateStore, days: int = 30) -> int:
+    hist = History(os.path.join(store.dir, "history.db"))
+    now = datetime.now().astimezone()
+    names = [d.name for d in devices] if target == "all" else [target]
+    for name in names:
+        s = hist.summary_for(name, now, days)
+        print(f"=== {name} - last {days} days ===")
+        print(f"  uptime {s['uptime_percent']}%   incidents {s['incidents']}   downtime {s['total_downtime']}   "
+              f"ping ok 24h {s['ping_success_last_24h_percent']}%   latency 24h {s['latency_ms']['avg_last_24h']} ms "
+              f"(prev 7d {s['latency_ms']['avg_prev_7d']} ms)")
+        if s["incidents_by_hour_of_day"]:
+            print("  outages by hour:", ", ".join(f"{h:02d}:00 x{n}" for h, n in s["incidents_by_hour_of_day"].items()))
+        for i in s["recent_incidents"]:
+            print(f"  {i['started']}  {i['kind']:20} {i['duration']:>8}  {i['diagnosis'] or ''}")
+        if s["config"]:
+            print(f"  config: last backup {s['config']['last_backup']}, {s['config']['lines']} lines, "
+                  f"{len(s['config']['recent_changes'])} change(s) in window")
+        print()
     return 0
 
 
@@ -170,6 +226,9 @@ def main(argv=None) -> int:
     g.add_argument("--status", action="store_true", help="print last known status and exit")
     g.add_argument("--test-alert", action="store_true", help="send a test alert and exit")
     g.add_argument("--diagnose", metavar="DEVICE|all", help="read-only diagnostics + AI diagnosis now: a name, a comma-separated list, or all")
+    g.add_argument("--history", metavar="DEVICE|all", help="print incident history and trends from history.db")
+    g.add_argument("--backup", action="store_true", help="back up all running-configs now and report changes")
+    g.add_argument("--report", action="store_true", help="build and send the weekly report now")
     args = p.parse_args(argv)
 
     settings = load_settings(args.settings)
@@ -203,6 +262,22 @@ def main(argv=None) -> int:
 
     if args.diagnose:
         return cmd_diagnose(args.diagnose, devices, settings, store)
+    if args.history:
+        return cmd_history(args.history, devices, store)
+    if args.backup:
+        hist = History(os.path.join(store.dir, "history.db"))
+        evs = backup.run([d for d in devices if d.enabled], settings, hist, datetime.now().astimezone(), force=True)
+        for e in evs:
+            print(f"{e.kind}: {e.title}\n{e.detail}\n")
+        print(f"{len(evs)} change(s) detected" if evs else "All configs unchanged (or first backup stored)")
+        hist.record_cycle({}, evs, datetime.now().astimezone())
+        notifier.send(evs)
+        return 0
+    if args.report:
+        hist = History(os.path.join(store.dir, "history.db"))
+        out = report.run(hist, [d for d in devices if d.enabled], settings, datetime.now().astimezone(), notifier)
+        print(out["text"])
+        return 0
 
     if args.check:
         dev = next((d for d in devices if d.name == args.check), None)

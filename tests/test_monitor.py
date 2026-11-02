@@ -571,3 +571,232 @@ def test_parse_response_falls_back_to_json_text_and_prose():
     assert d["summary"] == "The modem looks dead." and d["confidence"] == "low"
     with pytest.raises(ValueError):
         parse_response(SimpleNamespace(content=[]))
+
+
+# ---------------- Stage 2: history, trends, backup, weekly report ----------------
+from monitor import backup as backup_mod, report as report_mod, trends as trends_mod  # noqa: E402
+from monitor.history import History  # noqa: E402
+
+RUNNING_CFG = """Building configuration...
+
+Current configuration : 1234 bytes
+!
+! Last configuration change at 10:00:00 WST Mon Oct 27 2026
+version 15.4
+hostname rtr-143
+!
+enable secret 5 $1$abcd
+username admin privilege 15 secret 5 $1$efgh
+!
+interface GigabitEthernet0/0
+ ip address dhcp
+ ip nat outside
+!
+ip route 0.0.0.0 0.0.0.0 dhcp
+snmp-server community public RO
+end
+"""
+
+
+def res_rtt(ok=True, rtt=15, pct=None):
+    r = res(ok=ok)
+    r.ping = {"8.8.8.8": (100 if ok else 0) if pct is None else pct}
+    if ok or (pct and pct > 0):
+        r.rtt = {"8.8.8.8": rtt}
+    return r
+
+
+def test_parse_ping_rtt():
+    from monitor.parsers import parse_ping_rtt
+    assert parse_ping_rtt(PING_OK) == (12, 14, 18) and parse_ping_rtt(PING_FAIL) is None
+
+
+def test_history_incidents_open_close_and_summary(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    t = T0
+    evs_down = [Event("r1", "h", "INTERNET_DOWN", "critical", "down", "ping failed", (t + timedelta(minutes=10)).isoformat())]
+    evs_up = [Event("r1", "h", "INTERNET_RESTORED", "ok", "up", "back", (t + timedelta(minutes=40)).isoformat())]
+    h.record_cycle({"r1": res_rtt()}, [], t)
+    h.record_cycle({"r1": res_rtt(ok=False)}, evs_down, t + timedelta(minutes=10))
+    h.record_cycle({"r1": res_rtt()}, evs_up, t + timedelta(minutes=40))
+    inc = h.incidents("r1", t - timedelta(days=1))
+    assert len(inc) == 1 and inc[0]["duration_s"] == 1800 and inc[0]["ended_at"]
+    s = h.summary_for("r1", t + timedelta(hours=1), 30)
+    assert s["incidents"] == 1 and s["total_downtime"] == "30m" and s["recent_incidents"][0]["duration"] == "30m"
+    assert s["incidents_by_hour_of_day"] == {8: 1}
+    assert s["uptime_percent"] == round(100 * 2 / 3, 2)
+
+
+def test_history_prune_keeps_latest_config(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    old = T0 - timedelta(days=200)
+    h.record_cycle({"r1": res_rtt()}, [], old)
+    h.record_config("r1", old, "sha-old", "hostname a\n", None, 0, 0)
+    h.prune(T0, 90)
+    assert h.conn.execute("SELECT COUNT(*) FROM checks").fetchone()[0] == 0
+    assert h.latest_config("r1")["sha256"] == "sha-old"
+
+
+def _fill_latency(h, device, now, base_ms, recent_ms, every_min=5):
+    """7 days of checks: baseline latency, then the last 24h at recent_ms."""
+    t = now - timedelta(days=7)
+    while t < now:
+        ms = recent_ms if t >= now - timedelta(days=1) else base_ms
+        h.record_cycle({device: res_rtt(rtt=ms)}, [], t)
+        t += timedelta(minutes=every_min)
+
+
+def test_trend_latency_degraded_once_per_day(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    _fill_latency(h, DEV.name, T0, 15, 45, every_min=15)
+    states = {DEV.name: {"internet": "up"}}
+    evs = trends_mod.detect(h, [DEV], states, DEFAULT_SETTINGS, T0)
+    assert [e.kind for e in evs] == ["LATENCY_DEGRADED"] and "45 ms" in evs[0].detail and "15 ms" in evs[0].detail
+    assert trends_mod.detect(h, [DEV], states, DEFAULT_SETTINGS, T0 + timedelta(hours=1)) == []   # not repeated
+    _fill_latency(h, DEV.name, T0 + timedelta(hours=25), 15, 45, every_min=15)                  # still bad a day later
+    assert [e.kind for e in trends_mod.detect(h, [DEV], states, DEFAULT_SETTINGS, T0 + timedelta(hours=25))] == ["LATENCY_DEGRADED"]
+
+
+def test_trend_no_warning_when_stable_or_down(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    _fill_latency(h, DEV.name, T0, 15, 18, every_min=15)
+    assert trends_mod.detect(h, [DEV], {DEV.name: {"internet": "up"}}, DEFAULT_SETTINGS, T0) == []
+    _fill_latency(h, "r2", T0, 15, 90, every_min=15)
+    assert trends_mod.detect(h, [Device(**{**DEV.__dict__, "name": "r2"})], {"r2": {"internet": "down"}}, DEFAULT_SETTINGS, T0) == []
+
+
+def test_trend_packet_loss_and_flapping(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    t = T0 - timedelta(days=1)
+    while t < T0:
+        h.record_cycle({DEV.name: res_rtt(rtt=20, pct=60)}, [], t)   # 60% success all day
+        t += timedelta(minutes=15)
+    for i in range(3):
+        at = T0 - timedelta(hours=20 - i * 5)
+        h.record_cycle({}, [Event(DEV.name, DEV.host, "INTERNET_DOWN", "critical", "d", "x", at.isoformat())], at)
+        h.record_cycle({}, [Event(DEV.name, DEV.host, "INTERNET_RESTORED", "ok", "u", "x", (at + timedelta(minutes=10)).isoformat())], at)
+    kinds = sorted(e.kind for e in trends_mod.detect(h, [DEV], {DEV.name: {"internet": "up"}}, DEFAULT_SETTINGS, T0))
+    assert kinds == ["FLAPPING", "PACKET_LOSS"]
+
+
+def test_backup_normalise_redacts_and_diffs(tmp_path):
+    norm = backup_mod.normalise(RUNNING_CFG)
+    assert "$1$abcd" not in norm and "public" not in norm and "Last configuration change" not in norm
+    assert "hostname rtr-143" in norm and "ip address dhcp" in norm
+    h = History(str(tmp_path / "h.db"))
+    first = backup_mod.run([DEV], DEFAULT_SETTINGS, h, T0, connect=lambda d, t: FakeCfgConn(RUNNING_CFG), force=True)
+    assert [e.kind for e in first] == ["CONFIG_BACKUP"] and first[0].notify is False
+    again = backup_mod.run([DEV], DEFAULT_SETTINGS, h, T0 + timedelta(days=1),
+                           connect=lambda d, t: FakeCfgConn(RUNNING_CFG.replace("10:00:00", "11:11:11")), force=True)
+    assert again == []   # only a volatile line changed
+    changed = RUNNING_CFG.replace("ip address dhcp", "ip address 203.0.113.5 255.255.255.248")
+    third = backup_mod.run([DEV], DEFAULT_SETTINGS, h, T0 + timedelta(days=2), connect=lambda d, t: FakeCfgConn(changed), force=True)
+    assert [e.kind for e in third] == ["CONFIG_CHANGED"] and third[0].severity == "warning"
+    assert "- ip address dhcp" in third[0].detail and "+ ip address 203.0.113.5" in third[0].detail
+    assert h.latest_config(DEV.name)["added"] == 1 and h.latest_config(DEV.name)["removed"] == 1
+    assert not backup_mod.is_due(h, DEFAULT_SETTINGS, T0 + timedelta(days=2, hours=3))   # already done today
+    assert backup_mod.is_due(h, DEFAULT_SETTINGS, T0 + timedelta(days=3))                # 08:00 next day > hour 3
+
+
+class FakeCfgConn:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def send_command(self, cmd, read_timeout=None):
+        assert cmd == "show running-config"
+        return self.cfg
+
+    def disconnect(self):
+        pass
+
+
+class ReportNotifier:
+    def __init__(self):
+        self.reports, self.sent = [], []
+
+    def send(self, events, diagnosis=None):
+        self.sent.extend(events)
+
+    def send_report(self, subject, html_body, text):
+        self.reports.append((subject, html_body, text))
+
+
+def test_weekly_report_with_ai_narrative(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    _fill_latency(h, DEV.name, T0, 15, 16, every_min=30)
+    at = T0 - timedelta(days=2)
+    h.record_cycle({}, [Event(DEV.name, DEV.host, "INTERNET_DOWN", "critical", "d", "x", at.isoformat())], at)
+    h.record_cycle({}, [Event(DEV.name, DEV.host, "INTERNET_RESTORED", "ok", "u", "x", (at + timedelta(minutes=25)).isoformat())], at)
+    story = {"headline": "A quiet week apart from one 25-minute outage on r1.", "highlights": ["r1 down 25m on Mon 02:00"],
+             "recommendations": ["Check the modem log for Monday 02:00"]}
+    claude = FakeClaude(answer=story)
+    n = ReportNotifier()
+    out = report_mod.run(h, [DEV], AI_SETTINGS, T0, n, client=claude)
+    assert len(claude.calls) == 1 and claude.calls[0]["tools"][0]["name"] == "weekly_narrative"
+    subject, body, text = n.reports[0]
+    assert subject.startswith("Cisco WAN weekly report") and "1 outage" in subject
+    assert "quiet week" in body and "25m" in text and "r1" in text
+    assert h.get_meta("report:last_date") == T0.date().isoformat()
+    assert not report_mod.is_due(h, DEFAULT_SETTINGS, T0)
+    h.record_cycle({DEV.name: res_rtt()}, [], T0 - timedelta(days=8))   # enough history for a report
+    monday_9 = datetime(2026, 11, 2, 9, 0, tzinfo=T0.tzinfo)
+    assert report_mod.is_due(h, DEFAULT_SETTINGS, monday_9) and not report_mod.is_due(h, DEFAULT_SETTINGS, monday_9 + timedelta(days=1))
+
+
+def test_report_without_ai_still_sends(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    n = ReportNotifier()
+    out = report_mod.run(h, [DEV], DEFAULT_SETTINGS, T0, n)
+    assert out["story"] is None and n.reports and "ROUTER" in n.reports[0][2]
+
+
+def test_two_weeks_of_cycles_end_to_end(tmp_path):
+    """Simulated fortnight: history fills, backup runs once a day, a repeat outage is diagnosed with history,
+    latency creep raises a trend warning, and the Monday report goes out."""
+    hosts = [f"192.168.18.{n}" for n in (143, 145)]
+    routers = {h: {"show": SHOW_DHCP, "ping": PING_OK, "commands": []} for h in hosts}
+    devs = [Device(**{**DEV.__dict__, "name": f"rtr-{h.rsplit('.', 1)[1]}", "host": h}) for h in hosts]
+    settings = copy.deepcopy(AI_SETTINGS)
+    settings["backup"]["hour"] = 3
+    store, notifier, claude = StateStore(str(tmp_path)), ReportNotifier(), FakeClaude()
+    hist = History(str(tmp_path / "history.db"))
+    start = datetime(2026, 10, 19, 0, 0, tzinfo=T0.tzinfo)   # a Monday
+    t = start
+    step = timedelta(minutes=30)
+
+    def connect(device, timeout):
+        return FakeCfgConn(RUNNING_CFG) if mode["cfg"] else (DiagRouter(gw_ok=False, inet_ok=False) if mode["diag"] else FakeConn(routers[device.host]))
+    mode = {"cfg": False, "diag": False}
+
+    class Router:  # routes connections by command, so one connect() serves checks, backups and diagnostics
+        def __init__(self, host): self.host = host
+        def send_command(self, cmd, read_timeout=None):
+            if cmd == "show running-config":
+                return RUNNING_CFG
+            if cmd.startswith(("show version", "show interfaces", "show ip route", "show dhcp", "show ip arp", "traceroute", "show logging")) or "repeat 5 timeout 1" in cmd or "google.com" in cmd:
+                return DiagRouter(gw_ok=False, inet_ok=False).send_command(cmd)
+            return FakeConn(routers[self.host]).send_command(cmd)
+        def disconnect(self): pass
+
+    outage_days = {3, 10}   # Thursday 02:00 both weeks
+    while t < start + timedelta(days=14):
+        day = (t - start).days
+        for h in hosts:
+            routers[h]["ping"] = PING_FAIL if (day in outage_days and 2 <= t.hour < 3) else PING_OK.replace("12/14/18", f"12/{14 + day}/18")
+        run_cycle(devs, settings, store, notifier, connect=lambda d, to: Router(d.host), now_fn=lambda: t, ai_client=claude, hist=hist)
+        t += step
+
+    kinds = [e.kind for e in notifier.sent]
+    assert kinds.count("INTERNET_DOWN") == 4 and kinds.count("INTERNET_RESTORED") == 4   # 2 routers x 2 nights
+    assert hist.conn.execute("SELECT COUNT(*) FROM configs").fetchone()[0] == 2            # one snapshot each, unchanged after
+    assert hist.conn.execute("SELECT COUNT(*) FROM incidents WHERE category='internet'").fetchone()[0] == 4
+    diag_calls = [c for c in claude.calls if c["tools"][0]["name"] == "report_diagnosis"]
+    report_calls = [c for c in claude.calls if c["tools"][0]["name"] == "weekly_narrative"]
+    assert len(diag_calls) == 2 and len(report_calls) == 1
+    second = json.loads(diag_calls[1]["messages"][0]["content"].split("(JSON):\n\n", 1)[1].rsplit("\n\nDiagnose", 1)[0])
+    hist_ctx = second["history_last_30_days"]["rtr-143"]
+    assert hist_ctx["incidents"] >= 1 and hist_ctx["incidents_by_hour_of_day"].get("2") == 1
+    assert hist_ctx["config"]["last_backup"]
+    assert len(notifier.reports) == 1 and notifier.reports[0][0].startswith("Cisco WAN weekly report")
+    s = hist.summary_for("rtr-143", t, 14)
+    assert s["uptime_percent"] and 95 < s["uptime_percent"] < 100

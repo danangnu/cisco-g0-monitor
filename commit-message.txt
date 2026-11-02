@@ -1,10 +1,10 @@
-feat: add AI diagnosis of alerts (agent stage 1)
+feat: add memory, trends, config backup and weekly report (agent stage 2)
 
-- Run a fixed read-only command set on affected routers when an alert fires
-- Redact secrets from router output before analysis
-- Ask Claude once per alerting cycle for a structured fleet-level diagnosis
-- Put summary, likely cause, evidence and actions at the top of every alert
-- Cap API calls per hour and always fall back to a plain alert on failure
-- Record each diagnosis with its raw diagnostics in /data/diagnoses.jsonl
-- Add --diagnose DEVICE for on-demand diagnosis
-- Release version 1.1.0
+- Store every check, event, outage, diagnosis and config snapshot in SQLite
+- Give Claude each router's 30-day history on every alert
+- Warn on latency degradation, packet loss and flapping before a link fails
+- Back up running-configs daily, redacted, and alert with a diff on change
+- Send a weekly uptime/outage/latency report with an AI narrative
+- Record ping round-trip time from every check
+- Add --history, --backup and --report commands
+- Release version 1.2.0

@@ -91,6 +91,46 @@ docker compose run --rm cisco-g0-monitor --diagnose rtr-143,rtr-145  # some
 docker compose run --rm cisco-g0-monitor --diagnose all              # whole fleet, one diagnosis
 ```
 
+## Memory and trends (Stage 2 of the agent)
+
+Everything the monitor sees is kept in `/data/history.db` (SQLite, 90 days by default):
+every check with latency, every event, every outage with start/end/duration, every AI diagnosis
+and a daily redacted config snapshot per router. Four things are built on it:
+
+**1. History in every diagnosis.** On an alert, Claude also gets each router's last 30 days:
+outage count, times of day, durations, previous diagnoses, latency trend and config changes.
+So it can say *"4th outage this month on rtr-145, always 02:00-03:00, ~35 min; this is a pattern,
+not a one-off - ask the ISP about a maintenance window"* instead of diagnosing from scratch.
+
+**2. Trend warnings before a link fails** (no AI involved, rules over the history):
+
+| Event | Rule (defaults) |
+|---|---|
+| `LATENCY_DEGRADED` | 24h median round-trip >= 2x the previous week's median and >= 20 ms higher |
+| `PACKET_LOSS` | average ping success over 24h below 90% while the link is "up" |
+| `FLAPPING` | 3 or more outages in 24h |
+
+Each fires at most once per router per day and goes through the normal alert channels.
+
+**3. Daily config backup with diff.** Once a day (`backup.hour`, 03:00 by default) every router's
+`show running-config` is pulled, passwords/keys/communities are redacted, volatile lines are
+stripped and the result is stored. If it differs from the previous snapshot you get a
+`CONFIG_CHANGED` alert with the unified diff - the usual explanation for "the subnet changed".
+
+**4. Weekly report** (Monday 08:00 by default): per-router uptime, outages, downtime, longest
+outage, latency vs last week, ping success and config changes, with a short narrative and
+recommendations from Claude (one API call a week; the table is sent even if that fails).
+
+Commands:
+
+```bash
+docker compose run --rm cisco-g0-monitor --history all     # incidents, uptime, latency per router
+docker compose run --rm cisco-g0-monitor --backup          # back up configs now, print any diffs
+docker compose run --rm cisco-g0-monitor --report          # send the weekly report now
+```
+
+Inspect the database directly: `docker compose exec cisco-g0-monitor python -c "import sqlite3;print(sqlite3.connect('/data/history.db').execute('select device,kind,started_at,duration_s from incidents order by id desc limit 10').fetchall())"`
+
 ## How email is sent (TrackIT, same as Teltonika)
 
 The monitor does not talk to a mail server. Like `trackitDeviceFaultAlert.ts` in the Teltonika SMS Console, it inserts one row per recipient into TrackIT's `logbulkmail` table and TrackIT's mailer sends it:
@@ -177,8 +217,12 @@ monitor/
   notifier.py    dispatch to TrackIT / SMTP / Teams / Slack
   trackit.py     TrackIT logbulkmail queue (+ retry outbox)
   diagnose.py    Stage 1 AI: read-only diagnostics + Claude diagnosis
+  history.py     Stage 2: SQLite memory (checks, events, incidents, diagnoses, configs)
+  trends.py      Stage 2: latency / packet-loss / flapping warnings
+  backup.py      Stage 2: daily running-config backup + diff
+  report.py      Stage 2: weekly report
   state.py       state.json, events.jsonl, heartbeat
-  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose)
+  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report)
   healthcheck.py Docker HEALTHCHECK
 tests/           pytest suite with simulated IOS / IOS-XE output
 ```

@@ -36,6 +36,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "diagnose_reminders": False,         # also diagnose hourly STILL_DOWN reminders
         "collect_timeout_seconds": 120,
     },
+    "history": {"retention_days": 90},
+    "trends": {"enabled": True, "latency_ratio": 2.0, "latency_min_increase_ms": 20, "min_samples": 24,
+               "loss_threshold_percent": 90, "flap_incidents_24h": 3, "repeat_hours": 24},
+    "backup": {"enabled": True, "hour": 3, "max_diff_lines": 80, "warn_on_change": True},
+    "report": {"enabled": True, "weekday": 0, "hour": 8, "days": 7, "use_ai": True},
     "notify": {
         "trackit": {"enabled": False, "db_host": "", "db_port": 3306, "db_user": "", "db_password": "",
                     "db_name": "trackitlive", "to": [], "from": "", "from_name": "Cisco G0/0 Monitor",

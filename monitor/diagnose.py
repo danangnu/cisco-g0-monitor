@@ -258,6 +258,10 @@ Rules:
 - Recommended actions must be safe and concrete (e.g. "power-cycle the modem at 192.168.1.1",
   "check the cable on rtr-147 G0/0", "call the ISP with these traceroute results"). Never
   recommend configuration changes you cannot justify from the evidence.
+- Use the per-router history when it is provided: say whether this is a first occurrence or a repeat
+  (how many times, typical time of day, typical duration), whether latency had been creeping up, and
+  whether the configuration changed recently. A repeat pattern changes the recommendation (fix the root
+  cause, not just the symptom).
 - Keep the summary under 60 words. Write for someone reading an email on a phone."""
 
 
@@ -279,7 +283,7 @@ def _device_context(dv: Device, r: Optional[CheckResult], state: Optional[dict],
 
 
 def build_messages(events: list, devices: list[Device], results: dict, states: dict,
-                   diagnostics: dict[str, DeviceDiagnostics], now: datetime) -> list[dict]:
+                   diagnostics: dict[str, DeviceDiagnostics], now: datetime, history: Optional[dict] = None) -> list[dict]:
     alerted = {e.device for e in events}
     payload = {
         "time": now.isoformat(timespec="seconds"),
@@ -290,7 +294,10 @@ def build_messages(events: list, devices: list[Device], results: dict, states: d
                             diagnostics.get(dv.name) if dv.name in alerted else None)
             for dv in devices
         ],
+        "history_last_30_days": history or {},
         "note": ("Routers without 'diagnostics' are healthy this cycle; their latest_check is included for comparison. "
+                 "history_last_30_days is per-router memory: past incidents (with times and durations), when they tend "
+                 "to happen, latency trend, and config changes - use it to say whether this is new or a pattern. "
                  "Alerts of kind MANUAL_CHECK are an engineer asking for a health assessment, not a fault: for those, "
                  "report the link's condition (lease, gateway latency, errors, uptime) and anything worth watching."),
     }
@@ -392,7 +399,7 @@ def wants_diagnosis(events: list, cfg: dict) -> list:
 
 def diagnose_cycle(events: list, devices: list[Device], results: dict, states: dict, settings: dict,
                    state_dir: str, now: datetime, connect: Optional[Callable] = None,
-                   client=None, probe: Optional[Callable] = None) -> Optional[Diagnosis]:
+                   client=None, probe: Optional[Callable] = None, history=None) -> Optional[Diagnosis]:
     """Entry point used by the main loop. Returns None when nothing to do or on any failure."""
     cfg = settings.get("ai", {})
     if not cfg.get("enabled"):
@@ -414,7 +421,13 @@ def diagnose_cycle(events: list, devices: list[Device], results: dict, states: d
         log.info("  %s: %s in %.0fs%s", dd.device, "collected" if dd.collected else "NOT collected", dd.seconds,
                  f" ({dd.error}; tcp/22 open={dd.tcp_port_open})" if dd.error else "")
 
-    messages = build_messages(targets, devices, results, states, diagnostics, now)
+    hist_ctx = None
+    if history is not None:
+        try:
+            hist_ctx = {dv.name: history.summary_for(dv.name, now, 30) for dv in devices}
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not load history for diagnosis: %s", e)
+    messages = build_messages(targets, devices, results, states, diagnostics, now, hist_ctx)
     try:
         diag = ask_claude(messages, cfg, client=client)
     except Exception as e:  # noqa: BLE001 - never let the API block an alert

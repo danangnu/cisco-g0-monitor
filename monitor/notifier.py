@@ -60,6 +60,48 @@ class Notifier:
                 else:
                     log.exception("Failed to send alerts via %s", name)
 
+    def send_report(self, subject: str, body_html: str, text: str) -> None:
+        """Free-form report (weekly summary): HTML to TrackIT/SMTP, text to Teams/Slack."""
+        for name in self.channels():
+            try:
+                if name == "trackit":
+                    self.trackit.send_custom(subject, body_html)
+                elif name == "email":
+                    c = self.cfg["email"]
+                    msg = EmailMessage()
+                    msg["Subject"], msg["From"], msg["To"] = subject, c.get("from") or c.get("username"), ", ".join(c["to"])
+                    msg.set_content(text)
+                    msg.add_alternative(f"<html><body>{body_html}</body></html>", subtype="html")
+                    self._smtp_send(msg)
+                elif name == "teams":
+                    payload = {"type": "message", "attachments": [{
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard",
+                                    "version": "1.4", "msteams": {"width": "Full"}, "body": [
+                                        {"type": "TextBlock", "size": "Medium", "weight": "Bolder", "wrap": True, "text": subject},
+                                        {"type": "TextBlock", "wrap": True, "fontType": "Monospace", "text": text}]}}]}
+                    requests.post(self.cfg["teams"]["webhook_url"], json=payload, timeout=self.timeout).raise_for_status()
+                elif name == "slack":
+                    requests.post(self.cfg["slack"]["webhook_url"], json={"text": f"*{subject}*\n```{text}```"},
+                                  timeout=self.timeout).raise_for_status()
+                log.info("Sent report via %s", name)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Failed to send report via %s: %s", name, e)
+
+    def _smtp_send(self, msg: EmailMessage) -> None:
+        c = self.cfg["email"]
+        port = int(c.get("port") or 587)
+        security = (c.get("security") or "starttls").lower()
+        ctx = ssl.create_default_context()
+        server = (smtplib.SMTP_SSL(c["host"], port, timeout=self.timeout, context=ctx) if security == "ssl"
+                  else smtplib.SMTP(c["host"], port, timeout=self.timeout))
+        with server:
+            if security == "starttls":
+                server.starttls(context=ctx)
+            if c.get("username"):
+                server.login(c["username"], c.get("password", ""))
+            server.send_message(msg)
+
     # ---- TrackIT logbulkmail (same path the Teltonika SMS Console uses) -----
     def _send_trackit(self, events: list, diagnosis=None) -> None:
         self.trackit.send(events, diagnosis)
@@ -97,19 +139,7 @@ class Notifier:
             subtype="html",
         )
 
-        port = int(c.get("port") or 587)
-        security = (c.get("security") or "starttls").lower()
-        ctx = ssl.create_default_context()
-        if security == "ssl":
-            server = smtplib.SMTP_SSL(c["host"], port, timeout=self.timeout, context=ctx)
-        else:
-            server = smtplib.SMTP(c["host"], port, timeout=self.timeout)
-        with server:
-            if security == "starttls":
-                server.starttls(context=ctx)
-            if c.get("username"):
-                server.login(c["username"], c.get("password", ""))
-            server.send_message(msg)
+        self._smtp_send(msg)
 
     # ---- Microsoft Teams (Workflows / Power Automate webhook) ---------------
     def _send_teams(self, events: list, diagnosis=None) -> None:

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from .config import Device
-from .parsers import ParseError, parse_ping, parse_show_ip_interface
+from .parsers import ParseError, parse_ping, parse_ping_rtt, parse_show_ip_interface
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class CheckResult:
     network: Optional[str] = None
     addr_method: Optional[str] = None
     ping: dict = field(default_factory=dict)   # target -> success %
+    rtt: dict = field(default_factory=dict)    # target -> avg round-trip ms (only when replies came back)
     internet_ok: Optional[bool] = None
     reason: Optional[str] = None               # why internet_ok is False
 
@@ -97,12 +98,16 @@ def check_device(
         for target in device.ping_targets:
             cmd = build_ping_command(target, device.interface, device.vrf,
                                      ping_cfg["count"], ping_cfg["timeout"])
+            out = conn.send_command(cmd, read_timeout=read_timeout)
             try:
-                pct = parse_ping(conn.send_command(cmd, read_timeout=read_timeout))
+                pct = parse_ping(out)
             except ParseError as e:
                 log.warning("%s: could not parse ping to %s: %s", device.name, target, e)
                 pct = 0
             result.ping[target] = pct
+            rtt = parse_ping_rtt(out)
+            if rtt:
+                result.rtt[target] = rtt[1]
             if pct >= ping_cfg["min_success_percent"]:
                 break  # one good target is enough; skip the rest to save time
 

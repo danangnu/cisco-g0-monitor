@@ -35,6 +35,7 @@ _ADDR_MASK_RE = re.compile(
     r"Internet address is (?P<ip>\d{1,3}(?:\.\d{1,3}){3}) (?P<mask>\d{1,3}(?:\.\d{1,3}){3})"
 )
 _SUCCESS_RE = re.compile(r"Success rate is (?P<pct>\d+) percent \((?P<ok>\d+)/(?P<total>\d+)\)")
+_RTT_RE = re.compile(r"round-trip min/avg/max = (?P<min>\d+)/(?P<avg>\d+)/(?P<max>\d+) ms")
 _CLI_ERROR_RE = re.compile(r"^%\s*(Invalid|Incomplete|Ambiguous|Unrecognized)", re.M | re.I)
 
 
@@ -86,3 +87,9 @@ def parse_ping(output: str) -> int:
     if _CLI_ERROR_RE.search(output) or output.strip().startswith("%"):
         return 0
     raise ParseError("Could not find ping success rate")
+
+
+def parse_ping_rtt(output: str) -> Optional[tuple[int, int, int]]:
+    """Return (min, avg, max) round-trip ms from IOS ping output, or None if no reply."""
+    m = _RTT_RE.search(output)
+    return (int(m.group("min")), int(m.group("avg")), int(m.group("max"))) if m else None
