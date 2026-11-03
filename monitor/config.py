@@ -41,6 +41,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
                "loss_threshold_percent": 90, "flap_incidents_24h": 3, "repeat_hours": 24},
     "backup": {"enabled": True, "hour": 3, "max_diff_lines": 80, "warn_on_change": True},
     "report": {"enabled": True, "weekday": 0, "hour": 8, "days": 7, "use_ai": True},
+    "actions": {"enabled": True, "expire_hours": 4, "cooldown_hours": 6, "max_per_day": 4},
     "notify": {
         "trackit": {"enabled": False, "db_host": "", "db_port": 3306, "db_user": "", "db_password": "",
                     "db_name": "trackitlive", "to": [], "from": "", "from_name": "Cisco G0/0 Monitor",

@@ -1,6 +1,6 @@
 # cisco-g0-monitor
 
-Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
+Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, proposes fixes you approve with one command, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
 
 | Event | Severity | When |
 |---|---|---|
@@ -131,6 +131,46 @@ docker compose run --rm cisco-g0-monitor --report          # send the weekly rep
 
 Inspect the database directly: `docker compose exec cisco-g0-monitor python -c "import sqlite3;print(sqlite3.connect('/data/history.db').execute('select device,kind,started_at,duration_s from incidents order by id desc limit 10').fetchall())"`
 
+## Fixing things with your approval (Stage 3 of the agent)
+
+When the diagnosis points at a specific router (not the modem/ISP), Claude may propose **one** fix
+from a fixed catalogue. The alert then carries a "Proposed fix" box with a 4-letter ID, the exact
+commands, the expected impact, and the approve command:
+
+```
+docker compose run --rm cisco-g0-monitor --approve BTHW
+```
+
+| Action | Commands | Impact | Proposed when |
+|---|---|---|---|
+| `clear_arp_nat` | `clear arp-cache interface G0/0`, `clear ip nat translation *` | none | link up with a lease, but the gateway does not answer (stale ARP, e.g. after a modem swap) |
+| `renew_dhcp` | `release dhcp G0/0`, `renew dhcp G0/0` | ~10 s | link up but no / stale / wrong-subnet lease, modem answers ARP |
+| `bounce_interface` | `interface G0/0` → `shutdown`, 5 s, `no shutdown` | ~30-40 s | interface down/down or wedged, errors climbing, or renew already failed |
+
+What happens on `--approve`:
+
+1. The router is re-checked. If it already recovered, nothing runs (`not_needed`).
+2. The commands run exactly as shown. `bounce_interface` always sends `no shutdown`, even if the
+   session drops mid-way. Nothing ever writes to startup-config.
+3. After a settle time the router is checked again and a result email goes out: **Fix BTHW WORKED**
+   (before/after) or **DID NOT WORK** with the next step (escalate).
+4. Everything is recorded in `history.db` (`proposals` table): who approved, when, command output,
+   before/after state.
+
+Guard rails: nothing runs without `--approve`; one pending proposal per router; proposals expire after
+`actions.expire_hours`; a proposal is dropped automatically if the router recovers on its own; the same
+action on the same router at most once per `actions.cooldown_hours`; at most `actions.max_per_day`
+executed actions per day; never proposed for routers that are unreachable over SSH or for fleet-wide
+(upstream) outages; the catalogue is the only thing that can run - Claude picks from it, it cannot
+invent commands.
+
+```bash
+docker compose run --rm cisco-g0-monitor --proposals      # list proposals and outcomes
+docker compose run --rm cisco-g0-monitor --reject BTHW
+```
+
+Set `actions.enabled: false` to go back to diagnose-only.
+
 ## How email is sent (TrackIT, same as Teltonika)
 
 The monitor does not talk to a mail server. Like `trackitDeviceFaultAlert.ts` in the Teltonika SMS Console, it inserts one row per recipient into TrackIT's `logbulkmail` table and TrackIT's mailer sends it:
@@ -221,8 +261,9 @@ monitor/
   trends.py      Stage 2: latency / packet-loss / flapping warnings
   backup.py      Stage 2: daily running-config backup + diff
   report.py      Stage 2: weekly report
+  actions.py     Stage 3: fix catalogue, proposals, approved execution with verification
   state.py       state.json, events.jsonl, heartbeat
-  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report)
+  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report, --proposals, --approve, --reject)
   healthcheck.py Docker HEALTHCHECK
 tests/           pytest suite with simulated IOS / IOS-XE output
 ```

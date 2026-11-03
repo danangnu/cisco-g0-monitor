@@ -45,12 +45,20 @@ def build_report(events: list, recipient: str, diagnosis=None) -> dict:
 
     devices = sorted({e.device for e in events})
     critical = sum(e.severity == "critical" for e in events)
+    warning = sum(e.severity == "warning" for e in events)
+    recovered = sum(e.severity == "ok" for e in events)
+    kinds = {e.kind for e in events}
     if len(events) == 1:
         head = f"Cisco G0/0 alert: {events[0].title}"
+    elif recovered == len(events):                       # everything in this batch is a recovery
+        what = "INTERNET RESTORED" if kinds <= {"INTERNET_RESTORED"} else "RECOVERED"
+        head = f"Cisco G0/0 {what}: {', '.join(devices) if len(devices) <= 4 else f'{len(devices)} devices'}"
     elif len(devices) == 1:
         head = f"Cisco G0/0 alerts: {devices[0]} ({len(events)} events)"
     else:
-        head = f"Cisco G0/0 alerts: {len(devices)} devices ({critical} critical)"
+        parts = [p for p, n in ((f"{critical} critical", critical), (f"{warning} warning", warning),
+                                (f"{recovered} recovered", recovered)) if n]
+        head = f"Cisco G0/0 alerts: {len(devices)} devices ({', '.join(parts)})"
     tag = f" [{report_id}]"
     subject = head[: 180 - len(tag)] + tag   # keep the report ID even if the title is long
 

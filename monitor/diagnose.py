@@ -193,6 +193,9 @@ class Diagnosis:
     recommended_actions: list[str]
     confidence: str                  # low | medium | high
     per_device: list[dict]           # [{"device": ..., "finding": ...}]
+    proposed_action: Optional[dict] = None   # Claude's raw suggestion {action, device, reason}
+    no_action_reason: str = ""
+    proposal: Optional[dict] = None          # validated + stored proposal (actions.propose), with id/label/commands
     model: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
@@ -211,6 +214,16 @@ class Diagnosis:
             lines += ["Recommended actions:"] + [f"  {i}. {a}" for i, a in enumerate(self.recommended_actions, 1)]
         if self.per_device:
             lines += ["Per device:"] + [f"  - {d.get('device')}: {d.get('finding')}" for d in self.per_device]
+        if self.proposal:
+            p = self.proposal
+            lines += ["", f"PROPOSED FIX [{p['id']}] on {p['device']}: {p['label']} (risk: {p['risk']})",
+                      f"  Why: {p['reason']}", f"  Impact: {p['impact']}",
+                      f"  Commands: {'; '.join(p['commands'])}",
+                      f"  Approve:  docker compose run --rm cisco-g0-monitor --approve {p['id']}",
+                      f"  Reject:   docker compose run --rm cisco-g0-monitor --reject {p['id']}",
+                      f"  Expires:  {p['expires_at'][:16].replace('T', ' ')}"]
+        elif self.no_action_reason:
+            lines += ["", f"No fix proposed: {self.no_action_reason}"]
         return "\n".join(lines)
 
 
@@ -231,6 +244,19 @@ DIAGNOSIS_TOOL = {
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
             "per_device": {"type": "array", "items": {"type": "object", "properties": {
                 "device": {"type": "string"}, "finding": {"type": "string"}}, "required": ["device", "finding"]}},
+            "proposed_action": {
+                "type": "object",
+                "description": "OPTIONAL. One remediation from the allowed catalogue (see 'allowed_actions' in the input) "
+                               "for ONE router, only when the evidence points at that router rather than upstream. "
+                               "A human must approve it before it runs. Omit when no action is justified.",
+                "properties": {
+                    "action": {"type": "string"},
+                    "device": {"type": "string"},
+                    "reason": {"type": "string", "description": "Why this action should fix it, citing the evidence."},
+                },
+                "required": ["action", "device", "reason"],
+            },
+            "no_action_reason": {"type": "string", "description": "If no action is proposed, one line on why."},
         },
         "required": ["summary", "scope", "likely_cause", "evidence", "recommended_actions", "confidence", "per_device"],
     },
@@ -262,6 +288,12 @@ Rules:
   (how many times, typical time of day, typical duration), whether latency had been creeping up, and
   whether the configuration changed recently. A repeat pattern changes the recommendation (fix the root
   cause, not just the symptom).
+- You may propose ONE remediation for ONE router from 'allowed_actions' (it is never run without a human
+  approving it). Propose only when the evidence points at that router: a stale/absent/wrong-subnet lease,
+  a stale ARP entry for the gateway, a wedged or down/down interface. Do NOT propose anything for an
+  upstream/ISP outage (bouncing a router does not fix a modem) or when all routers failed together,
+  and do not propose for a router that is unreachable over SSH. Prefer the lowest-risk action that fits.
+  If you do not propose one, say why in no_action_reason.
 - Keep the summary under 60 words. Write for someone reading an email on a phone."""
 
 
@@ -282,6 +314,14 @@ def _device_context(dv: Device, r: Optional[CheckResult], state: Optional[dict],
     return ctx
 
 
+def _allowed_actions() -> list[dict]:
+    try:
+        from .actions import describe_for_prompt
+        return describe_for_prompt()
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def build_messages(events: list, devices: list[Device], results: dict, states: dict,
                    diagnostics: dict[str, DeviceDiagnostics], now: datetime, history: Optional[dict] = None) -> list[dict]:
     alerted = {e.device for e in events}
@@ -295,6 +335,7 @@ def build_messages(events: list, devices: list[Device], results: dict, states: d
             for dv in devices
         ],
         "history_last_30_days": history or {},
+        "allowed_actions": _allowed_actions(),
         "note": ("Routers without 'diagnostics' are healthy this cycle; their latest_check is included for comparison. "
                  "history_last_30_days is per-router memory: past incidents (with times and durations), when they tend "
                  "to happen, latency trend, and config changes - use it to say whether this is new or a pattern. "
@@ -361,6 +402,8 @@ def ask_claude(messages: list[dict], cfg: dict, client=None) -> Diagnosis:
         recommended_actions=[str(x) for x in data.get("recommended_actions", [])][:8],
         confidence=str(data.get("confidence", "low")),
         per_device=[d for d in data.get("per_device", []) if isinstance(d, dict)][:20],
+        proposed_action=data.get("proposed_action") if isinstance(data.get("proposed_action"), dict) else None,
+        no_action_reason=str(data.get("no_action_reason", "") or "")[:300],
         model=getattr(resp, "model", cfg["model"]),
         input_tokens=getattr(usage, "input_tokens", 0) or 0,
         output_tokens=getattr(usage, "output_tokens", 0) or 0,
@@ -433,6 +476,12 @@ def diagnose_cycle(events: list, devices: list[Device], results: dict, states: d
     except Exception as e:  # noqa: BLE001 - never let the API block an alert
         log.warning("Claude diagnosis failed (%s: %s); sending alert without diagnosis", type(e).__name__, e)
         return None
+    if diag.proposed_action and history is not None:
+        try:
+            from . import actions
+            diag.proposal = actions.propose(history, settings, devices, diag.proposed_action, targets, now)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not store proposal: %s", e)
     log.info("AI diagnosis (%s, %s confidence, %d+%d tokens, %.0fs): %s",
              diag.scope, diag.confidence, diag.input_tokens, diag.output_tokens, diag.seconds, diag.summary)
     try:

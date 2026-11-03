@@ -10,6 +10,9 @@ Usage:
   python -m monitor.main --history all   # incident history, uptime, latency trend
   python -m monitor.main --backup        # back up running-configs now, report diffs
   python -m monitor.main --report        # send the weekly report now
+  python -m monitor.main --proposals     # list proposed fixes
+  python -m monitor.main --approve A7K3  # run a proposed fix after re-checking the fault
+  python -m monitor.main --reject A7K3
 """
 from __future__ import annotations
 
@@ -24,7 +27,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from . import backup, report, trends
+from . import actions, backup, report, trends
 from .collector import _default_connect, check_device
 from .diagnose import diagnose_cycle
 from .history import History
@@ -64,10 +67,6 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
                      r.intf_status, r.intf_protocol,
                      {True: "OK", False: "FAIL", None: "?"}[r.internet_ok],
                      r.ping or "-", f"  [{r.error}]" if r.error else "")
-    for e in all_events:
-        log.log(logging.WARNING if e.severity in ("critical", "warning") else logging.INFO,
-                "EVENT %s: %s - %s", e.kind, e.title, e.detail)
-
     store.save(new_states)  # devices removed from inventory drop out of state here
 
     # Stage 2: trend warnings from history (latency creeping up, packet loss, flapping)
@@ -82,6 +81,16 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
             all_events += backup.run(active, settings, hist, now, connect=connect)
         except Exception:  # noqa: BLE001
             log.exception("Config backup failed")
+
+    # Stage 3: expire old proposals / drop ones whose router recovered by itself
+    try:
+        all_events += actions.housekeeping(hist, new_states, now)
+    except Exception:  # noqa: BLE001
+        log.exception("Proposal housekeeping failed")
+
+    for e in all_events:
+        log.log(logging.WARNING if e.severity in ("critical", "warning") else logging.INFO,
+                "EVENT %s%s: %s - %s", e.kind, "" if e.notify else " (not notified)", e.title, e.detail)
 
     # Stage 1 AI: investigate alert-worthy events before notifying (never blocks the alert on failure)
     diagnosis = diagnose_cycle(all_events, active, results, new_states, settings, store.dir, now,
@@ -176,6 +185,55 @@ def cmd_diagnose(target: str, devices, settings, store: StateStore) -> int:
     return 0
 
 
+def cmd_actions(args, devices, settings, store: StateStore, notifier: Notifier) -> int:
+    hist = History(os.path.join(store.dir, "history.db"))
+    now = datetime.now().astimezone()
+    if args.proposals:
+        rows = actions.list_recent(hist)
+        if not rows:
+            print("No proposals yet.")
+            return 0
+        print(f"{'ID':5} {'CREATED':17} {'DEVICE':14} {'ACTION':18} {'STATUS':11} RESULT / REASON")
+        for r in rows:
+            print(f"{r['id']:5} {r['created_at'][:16].replace('T', ' '):17} {r['device']:14} {r['action']:18} "
+                  f"{r['status']:11} {(r['result'] or r['reason'] or '')[:70]}")
+        return 0
+    if args.reject:
+        try:
+            p = actions.reject(hist, args.reject, now, who=os.environ.get("USERNAME") or os.environ.get("USER") or "operator")
+        except ValueError as e:
+            print(e)
+            return 1
+        print(f"Proposal {p['id']} rejected ({p['action']} on {p['device']}).")
+        return 0
+    pid = args.approve
+    p = actions.get(hist, pid)
+    if not p:
+        print(f"No proposal {pid!r}. Use --proposals to list them.")
+        return 1
+    dev = next((d for d in devices if d.name == p["device"]), None)
+    act = actions.ACTIONS.get(p["action"])
+    if not dev or not act:
+        print(f"Proposal {pid} refers to an unknown device/action.")
+        return 1
+    print(f"Proposal {p['id']}: {act.label.format(intf=dev.interface)} on {dev.name} ({dev.host})")
+    print(f"  Status: {p['status']}   Expires: {p['expires_at'][:16].replace('T', ' ')}")
+    print(f"  Why:    {p['reason']}")
+    print(f"  Impact: {act.impact}")
+    print("  Commands: " + " ; ".join(actions.render_commands(act, dev)))
+    print("Re-checking the router, then running the fix...")
+    try:
+        p, ev = actions.execute(hist, settings, devices, pid, who=os.environ.get("USERNAME") or os.environ.get("USER") or "operator")
+    except ValueError as e:
+        print(e)
+        return 1
+    print()
+    print(f"{ev.title}\n{ev.detail}")
+    hist.record_cycle({}, [ev], now)
+    notifier.send([ev])
+    return 0 if p["status"] in ("succeeded", "not_needed") else 2
+
+
 def cmd_history(target: str, devices, store: StateStore, days: int = 30) -> int:
     hist = History(os.path.join(store.dir, "history.db"))
     now = datetime.now().astimezone()
@@ -229,6 +287,9 @@ def main(argv=None) -> int:
     g.add_argument("--history", metavar="DEVICE|all", help="print incident history and trends from history.db")
     g.add_argument("--backup", action="store_true", help="back up all running-configs now and report changes")
     g.add_argument("--report", action="store_true", help="build and send the weekly report now")
+    g.add_argument("--approve", metavar="ID", help="approve and run a proposed fix (ID from the alert email)")
+    g.add_argument("--reject", metavar="ID", help="reject a proposed fix")
+    g.add_argument("--proposals", action="store_true", help="list recent proposed fixes and their status")
     args = p.parse_args(argv)
 
     settings = load_settings(args.settings)
@@ -269,10 +330,14 @@ def main(argv=None) -> int:
         evs = backup.run([d for d in devices if d.enabled], settings, hist, datetime.now().astimezone(), force=True)
         for e in evs:
             print(f"{e.kind}: {e.title}\n{e.detail}\n")
-        print(f"{len(evs)} change(s) detected" if evs else "All configs unchanged (or first backup stored)")
+        changed = sum(e.kind == "CONFIG_CHANGED" for e in evs)
+        first = sum(e.kind == "CONFIG_BACKUP" for e in evs)
+        print(f"{changed} config change(s), {first} first snapshot(s) stored" if evs else "All configs unchanged")
         hist.record_cycle({}, evs, datetime.now().astimezone())
         notifier.send(evs)
         return 0
+    if args.approve or args.reject or args.proposals:
+        return cmd_actions(args, devices, settings, store, notifier)
     if args.report:
         hist = History(os.path.join(store.dir, "history.db"))
         out = report.run(hist, [d for d in devices if d.enabled], settings, datetime.now().astimezone(), notifier)

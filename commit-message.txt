@@ -1,10 +1,13 @@
-feat: add memory, trends, config backup and weekly report (agent stage 2)
+feat: propose and run fixes with operator approval (agent stage 3)
 
-- Store every check, event, outage, diagnosis and config snapshot in SQLite
-- Give Claude each router's 30-day history on every alert
-- Warn on latency degradation, packet loss and flapping before a link fails
-- Back up running-configs daily, redacted, and alert with a diff on change
-- Send a weekly uptime/outage/latency report with an AI narrative
-- Record ping round-trip time from every check
-- Add --history, --backup and --report commands
-- Release version 1.2.0
+- Add a fixed remediation catalogue: clear ARP/NAT, renew DHCP, bounce G0/0
+- Let Claude propose one catalogue action per alert, validated against the allow-list
+- Show the proposed fix, commands, impact and approve command in every alert
+- Add --approve/--reject/--proposals; re-check the fault before running anything
+- Always restore the interface after a bounce, verify after a settle time, email the result
+- Expire proposals, drop them when the router recovers, enforce cooldown and daily cap
+- Record every proposal and execution with before/after state in history.db
+- Make recovery email subjects explicit (INTERNET RESTORED: rtr-143, ...)
+- Count outage duration from the first failure across flaps and report brief recoveries
+- Log every event, including trend, backup and housekeeping events
+- Release version 1.3.1

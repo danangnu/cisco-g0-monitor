@@ -800,3 +800,210 @@ def test_two_weeks_of_cycles_end_to_end(tmp_path):
     assert len(notifier.reports) == 1 and notifier.reports[0][0].startswith("Cisco WAN weekly report")
     s = hist.summary_for("rtr-143", t, 14)
     assert s["uptime_percent"] and 95 < s["uptime_percent"] < 100
+
+
+# ---------------- Stage 3: proposals and approved actions ----------------
+from monitor import actions as act_mod  # noqa: E402
+
+
+class ActionRouter:
+    """Fake router whose internet state can be flipped by the right fix."""
+    def __init__(self, broken_by="dhcp"):
+        self.broken_by, self.cmds, self.config_sets = broken_by, [], []
+        self.fixed = False
+
+    def _show(self):
+        if self.broken_by == "dhcp" and not self.fixed:
+            return SHOW_NO_IP
+        return SHOW_DHCP
+
+    def send_command(self, cmd, read_timeout=None):
+        self.cmds.append(cmd)
+        if cmd.startswith("show ip interface"):
+            return self._show()
+        if cmd.startswith("ping"):
+            return PING_OK if self.fixed else PING_FAIL
+        if cmd.startswith("renew dhcp") and self.broken_by == "dhcp":
+            self.fixed = True
+        if cmd.startswith("clear arp-cache") and self.broken_by == "arp":
+            self.fixed = True
+        return ""
+
+    def send_config_set(self, lines):
+        self.config_sets.append(list(lines))
+        if "no shutdown" in lines and self.broken_by == "wedged":
+            self.fixed = True
+        return "\n".join(lines)
+
+    def disconnect(self):
+        pass
+
+
+def test_action_catalogue_is_safe():
+    for a in act_mod.ACTIONS.values():
+        joined = " ".join(a.exec_cmds + a.config_cmds + a.restore_cmds)
+        assert "write" not in joined and "reload" not in joined and "{intf}" in joined
+        if a.config_cmds:
+            assert a.restore_cmds and "no shutdown" in a.restore_cmds
+    assert act_mod.render_commands(act_mod.ACTIONS["bounce_interface"], DEV) == [
+        "configure terminal", "interface GigabitEthernet0/0", "shutdown", "(wait 5 s)",
+        "interface GigabitEthernet0/0", "no shutdown", "end"]
+
+
+def test_propose_validates_and_stores(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    evs = [ev(kind="INTERNET_DOWN")]
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "reload", "device": "r1", "reason": "x"}, evs, T0) is None
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "nope", "reason": "x"}, evs, T0) is None
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"},
+                           [ev(kind="SUBNET_CHANGED", sev="warning")], T0) is None          # not applicable
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "lease lost"}, evs, T0)
+    assert p and len(p["id"]) == 4 and p["status"] == "pending" and p["label"].startswith("Release and renew")
+    assert p["commands"] == ["release dhcp GigabitEthernet0/0", "renew dhcp GigabitEthernet0/0"]
+    # one pending per device
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "clear_arp_nat", "device": "r1", "reason": "x"}, evs, T0) is None
+    assert act_mod.get(h, p["id"].lower())["expires_at"] == (T0 + timedelta(hours=4)).isoformat(timespec="seconds")
+
+
+def test_housekeeping_expires_and_supersedes(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    evs = [ev(kind="INTERNET_DOWN")]
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, evs, T0)
+    out = act_mod.housekeeping(h, {"r1": {"internet": "up"}}, T0 + timedelta(minutes=10))
+    assert act_mod.get(h, p["id"])["status"] == "superseded" and out[0].kind == "PROPOSAL_SUPERSEDED"
+    p2 = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, evs, T0)
+    act_mod.housekeeping(h, {"r1": {"internet": "down"}}, T0 + timedelta(hours=5))
+    assert act_mod.get(h, p2["id"])["status"] == "expired"
+    with pytest.raises(ValueError):
+        act_mod.execute(h, DEFAULT_SETTINGS, [DEV], p2["id"], now_fn=lambda: T0 + timedelta(hours=5))
+
+
+def test_execute_renew_dhcp_success(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    r = ActionRouter("dhcp")
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "no lease"},
+                        [ev(kind="ADDRESS_LOST")], T0)
+    sleeps = []
+    row, e = act_mod.execute(h, DEFAULT_SETTINGS, [DEV], p["id"], now_fn=lambda: T0, connect=lambda d, t: r,
+                             sleep=sleeps.append, who="danang")
+    assert row["status"] == "succeeded" and e.kind == "ACTION_SUCCEEDED" and "WORKED" in e.title
+    assert "release dhcp GigabitEthernet0/0" in r.cmds and "renew dhcp GigabitEthernet0/0" in r.cmds
+    assert sleeps == [20]
+    assert json.loads(row["before_state"])["ip"] is None and json.loads(row["after_state"])["internet_ok"] is True
+    assert row["decided_by"] == "danang" and "Approved by danang" in e.detail
+
+
+def test_execute_bounce_always_restores_and_reports_failure(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+
+    class Flaky(ActionRouter):
+        def send_config_set(self, lines):
+            super().send_config_set(lines)
+            if "shutdown" in lines and "no shutdown" not in lines:
+                raise RuntimeError("session dropped")
+            return ""
+    r = Flaky("upstream")   # nothing fixes it
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "bounce_interface", "device": "r1", "reason": "x"},
+                        [ev(kind="INTERNET_DOWN")], T0)
+    row, e = act_mod.execute(h, DEFAULT_SETTINGS, [DEV], p["id"], now_fn=lambda: T0, connect=lambda d, t: r, sleep=lambda s: None)
+    assert ["interface GigabitEthernet0/0", "no shutdown"] in r.config_sets      # restore ran despite the error
+    assert row["status"] == "failed" and e.kind == "ACTION_FAILED" and "session dropped" in e.detail
+    assert "escalate" in e.detail
+
+
+def test_execute_skips_when_already_recovered(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    r = ActionRouter("dhcp"); r.fixed = True
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, [ev(kind="INTERNET_DOWN")], T0)
+    row, e = act_mod.execute(h, DEFAULT_SETTINGS, [DEV], p["id"], now_fn=lambda: T0, connect=lambda d, t: r, sleep=lambda s: None)
+    assert row["status"] == "not_needed" and e.kind == "ACTION_NOT_NEEDED"
+    assert not any(c.startswith(("release", "renew")) for c in r.cmds)
+
+
+def test_cooldown_and_daily_cap(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    r = ActionRouter("dhcp")
+    evs = [ev(kind="INTERNET_DOWN")]
+    p = act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, evs, T0)
+    act_mod.execute(h, DEFAULT_SETTINGS, [DEV], p["id"], now_fn=lambda: T0, connect=lambda d, t: r, sleep=lambda s: None)
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, evs, T0 + timedelta(hours=1)) is None
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, evs, T0 + timedelta(hours=7))
+    capped = copy.deepcopy(DEFAULT_SETTINGS); capped["actions"]["max_per_day"] = 1
+    assert act_mod.propose(h, capped, [DEV], {"action": "clear_arp_nat", "device": "r1", "reason": "x"}, evs, T0 + timedelta(hours=1)) is None
+
+
+def test_alert_with_proposal_end_to_end(tmp_path):
+    """Outage -> diagnosis proposes renew_dhcp -> email shows it -> --approve runs it -> result event."""
+    from monitor import main as main_mod
+    host = "192.168.18.143"
+    router = {host: {"show": SHOW_DHCP, "ping": PING_OK, "commands": []}}
+    dev = Device(**{**DEV.__dict__, "name": "rtr-143", "host": host})
+    answer = {**FakeClaude().answer, "scope": "single_device",
+              "proposed_action": {"action": "renew_dhcp", "device": "rtr-143", "reason": "G0/0 is up/up with no lease; modem answers ARP"}}
+    claude = FakeClaude(answer=answer)
+    store, notifier = StateStore(str(tmp_path)), CaptureNotifier()
+    hist = History(str(tmp_path / "history.db"))
+    clock = iter(T0 + timedelta(minutes=5 * i) for i in range(10))
+    seq = {"n": 0}
+
+    def connect(d, t):
+        seq["n"] += 1
+        return FakeConn(router[host]) if seq["n"] <= 1 else DiagRouter(gw_ok=True, inet_ok=False)
+    def cycle():
+        seq["n"] = 0
+        run_cycle([dev], AI_SETTINGS, store, notifier, connect=connect, now_fn=lambda: next(clock), ai_client=claude, hist=hist)
+
+    cycle()
+    router[host]["ping"] = PING_FAIL
+    cycle(); cycle()
+    d = notifier.diagnosis
+    assert d and d.proposal and d.proposal["action"] == "renew_dhcp" and d.proposal["device"] == "rtr-143"
+    assert "allowed_actions" in claude.calls[0]["messages"][0]["content"]
+    body = diagnosis_html(d)
+    assert f"--approve {d.proposal['id']}" in body and "release dhcp GigabitEthernet0/0" in body
+    assert "PROPOSED FIX" in d.as_text()
+    # a second cycle while still down must not create a second proposal
+    cycle()
+    assert len(act_mod.list_recent(hist)) == 1
+
+    # approve it
+    ar = ActionRouter("dhcp")
+    row, e = act_mod.execute(hist, AI_SETTINGS, [dev], d.proposal["id"], now_fn=lambda: next(clock),
+                             connect=lambda dd, t: ar, sleep=lambda s: None)
+    assert row["status"] == "succeeded" and e.kind == "ACTION_SUCCEEDED"
+    assert hist.conn.execute("SELECT status FROM proposals").fetchone()[0] == "succeeded"
+
+
+def test_proposal_not_created_for_unreachable_or_upstream(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    # DEVICE_UNREACHABLE is not in any action's applies_to
+    assert act_mod.propose(h, DEFAULT_SETTINGS, [DEV], {"action": "bounce_interface", "device": "r1", "reason": "x"},
+                           [ev(kind="DEVICE_UNREACHABLE")], T0) is None
+    off = copy.deepcopy(DEFAULT_SETTINGS); off["actions"]["enabled"] = False
+    assert act_mod.propose(h, off, [DEV], {"action": "renew_dhcp", "device": "r1", "reason": "x"}, [ev(kind="INTERNET_DOWN")], T0) is None
+
+
+def test_flapping_link_keeps_outage_start_and_counts_flaps():
+    seq = [res(), res(ok=False), res(ok=False), res(), res(ok=False), res(), res(ok=False), res(ok=False)]
+    seq += [res(ok=False)] * 12 + [res(), res()]
+    state, out = run(seq)
+    flat = [k for ks in out for k in ks]
+    assert flat.count("INTERNET_DOWN") == 1 and flat.count("INTERNET_RESTORED") == 1
+    # the reminder (fires ~60 min after the first alert) must report the full duration, not 0m
+    st, outs = None, []
+    for i, r in enumerate(seq):
+        st, ev_ = evaluate(st, r, DEV, DEFAULT_SETTINGS, T0 + timedelta(minutes=5 * i))
+        outs += ev_
+    rem = [e for e in outs if e.kind == "INTERNET_STILL_DOWN"]
+    assert rem and "Down for 1h" in rem[0].detail and "came back briefly 2x" in rem[0].detail
+    restored = [e for e in outs if e.kind == "INTERNET_RESTORED"][0]
+    assert "came back briefly 2x" in restored.detail and "Down for 1h" in restored.detail
+
+
+def test_subjects_say_recovered():
+    from monitor.notifier import _subject
+    ups = [Event(f"rtr-{n}", "h", "INTERNET_RESTORED", "ok", f"INTERNET RESTORED on rtr-{n}", "x", "2026-11-03T10:52:00+08:00") for n in (143, 145, 147, 149)]
+    assert build_report(ups, "a@x.com")["subject"].startswith("Cisco G0/0 INTERNET RESTORED: rtr-143, rtr-145, rtr-147, rtr-149 [")
+    assert _subject(ups).startswith("[Cisco G0/0 Monitor] RECOVERED: rtr-143, rtr-145, rtr-147, rtr-149")
+    mixed = ups[:2] + [ev("rtr-147"), ev("rtr-149", "FLAPPING", "warning")]
+    assert "(1 critical, 1 warning, 2 recovered)" in build_report(mixed, "a@x.com")["subject"]

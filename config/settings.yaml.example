@@ -56,6 +56,15 @@ report:                            # weekly summary: uptime, outages, latency, c
   days: 7
   use_ai: true                     # one Claude call per week for the narrative on top of the table
 
+# Stage 3: remediation with approval. Claude may propose ONE fix from a fixed catalogue
+# (clear ARP/NAT, renew DHCP lease, bounce G0/0). Nothing runs until you execute
+# `--approve <ID>` on the monitor PC; the fault is re-checked first.
+actions:
+  enabled: true
+  expire_hours: 4                  # a proposal you don't act on expires after this
+  cooldown_hours: 6                # same action on the same router at most once per 6h
+  max_per_day: 4                   # hard cap on executed actions across the fleet per 24h
+
 notify:
   # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
   # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.

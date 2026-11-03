@@ -40,6 +40,7 @@ def new_state() -> dict:
         "internet_fail_count": 0,
         "internet_ok_count": 0,
         "internet_fail_since": None,
+        "internet_flaps": 0,          # brief recoveries (< recovery threshold) during a down period
         "baseline_network": None,
         "baseline_ip": None,
         "mismatch_network": None,
@@ -183,17 +184,21 @@ def evaluate(prev: Optional[dict], r: CheckResult, device: Device, settings: dic
         if s["internet"] == "down":
             s["internet_ok_count"] += 1
             if s["internet_ok_count"] >= ok_n:
+                flaps = s.get("internet_flaps", 0)
                 emit("INTERNET_RESTORED", OK, f"INTERNET RESTORED on {device.name} ({intf})",
-                     f"Down for {_fmt_duration(s['internet_fail_since'], now)}. "
+                     f"Down for {_fmt_duration(s['internet_fail_since'], now)}"
+                     + (f" (came back briefly {flaps}x before staying up)" if flaps else "") + ". "
                      f"Ping: {_ping_summary(r)}. {intf} = {r.ip}.",
                      notify=alerts.get("send_recovery", True))
-                s["internet"], s["internet_ok_count"], s["internet_fail_since"] = "up", 0, None
+                s["internet"], s["internet_ok_count"], s["internet_fail_since"], s["internet_flaps"] = "up", 0, None, 0
         else:
             s["internet"], s["internet_ok_count"], s["internet_fail_since"] = "up", 0, None
     elif r.internet_ok is False:
+        if s["internet"] == "down" and s["internet_ok_count"] > 0:
+            s["internet_flaps"] = s.get("internet_flaps", 0) + 1   # was briefly OK, failed again: still one outage
         s["internet_ok_count"] = 0
         s["internet_fail_count"] += 1
-        if s["internet_fail_count"] == 1:
+        if s["internet_fail_count"] == 1 and s["internet"] != "down":
             s["internet_fail_since"] = now_iso
         if s["internet"] != "down" and s["internet_fail_count"] >= fail_n:
             s["internet"] = "down"
@@ -203,8 +208,11 @@ def evaluate(prev: Optional[dict], r: CheckResult, device: Device, settings: dic
                  f"{intf} = {r.ip or 'no IP'}, status {r.intf_status}/{r.intf_protocol}.")
         elif s["internet"] == "down" and _reminder_due(s, now, repeat):
             s["last_reminder_at"] = now_iso
+            flaps = s.get("internet_flaps", 0)
             emit("INTERNET_STILL_DOWN", CRITICAL, f"STILL DOWN: internet on {device.name} ({intf})",
-                 f"Down for {_fmt_duration(s['internet_fail_since'], now)}. {r.reason}.")
+                 f"Down for {_fmt_duration(s['internet_fail_since'], now)}"
+                 + (f"; came back briefly {flaps}x but never for 2 checks in a row (unstable link)" if flaps else "")
+                 + f". {r.reason}.")
     # internet_ok None -> check was incomplete; leave internet state untouched
 
     return s, events
