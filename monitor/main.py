@@ -12,6 +12,7 @@ Usage:
   python -m monitor.main --report        # send the weekly report now
   python -m monitor.main --audit all     # security audit of running-configs, emails the report
   python -m monitor.main --audit-fix rtr-143   # remediation script for one router
+  python -m monitor.main --accept all "SHA-1 methods only" --reason "1921 IOS limitation"
   python -m monitor.main --proposals     # list proposed fixes
   python -m monitor.main --approve A7K3  # run a proposed fix after re-checking the fault
   python -m monitor.main --reject A7K3
@@ -80,14 +81,15 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
     # Stage 2: daily config backup (runs inside the cycle after the configured hour, once per day)
     if backup.is_due(hist, settings, now):
         raw_configs: dict = {}
+        facts: dict = {}
         try:
-            all_events += backup.run(active, settings, hist, now, connect=connect, raw_out=raw_configs)
+            all_events += backup.run(active, settings, hist, now, connect=connect, raw_out=raw_configs, facts_out=facts)
         except Exception:  # noqa: BLE001
             log.exception("Config backup failed")
         # Stage 4: security audit of today's configs (report only when something changed)
         if raw_configs and settings.get("audit", {}).get("enabled", True):
             try:
-                posture.run_audit(hist, settings, raw_configs, active, now, notifier=notifier, client=ai_client)
+                posture.run_audit(hist, settings, raw_configs, active, now, notifier=notifier, client=ai_client, facts=facts)
             except Exception:  # noqa: BLE001
                 log.exception("Security audit failed")
         raw_configs.clear()
@@ -256,6 +258,16 @@ def cmd_audit(args, devices, settings, store: StateStore, notifier: Notifier) ->
         fs = [Finding(r["rule"], r["severity"], r["title"], r["detail"], r["fix"], r["evidence"], r["device"]) for r in rows]
         print(fix_script(fs, args.audit_fix))
         return 0
+    if args.accept:
+        rows = posture.accept(hist, args.accept[0], args.accept[1], args.reason or "accepted by operator", now)
+        for r in rows:
+            print(f"accepted  {r['device']:14} {r['title']}")
+        print(f"{len(rows)} finding(s) accepted" + ("" if rows else f" - nothing open matches {args.accept[1]!r}"))
+        return 0
+    if args.unaccept:
+        n = posture.unaccept(hist, args.unaccept[0], args.unaccept[1])
+        print(f"{n} finding(s) re-opened")
+        return 0
     if args.config_diff:
         rows = hist.conn.execute("SELECT device, ts, added, removed, diff FROM configs WHERE diff IS NOT NULL "
                                  "ORDER BY id DESC LIMIT ?", (int(args.config_diff),)).fetchall()
@@ -269,13 +281,14 @@ def cmd_audit(args, devices, settings, store: StateStore, notifier: Notifier) ->
         return 1
     print(f"Pulling running-config from {len(chosen)} router(s)...")
     raw: dict = {}
-    backup.run(chosen, settings, hist, now, force=True, raw_out=raw)   # also stores today's snapshot/diff
+    facts: dict = {}
+    backup.run(chosen, settings, hist, now, force=True, raw_out=raw, facts_out=facts)   # also stores today's snapshot/diff
     missing = [d.name for d in chosen if d.name not in raw]
     if missing:
         print(f"Could not fetch: {', '.join(missing)}")
     if not raw:
         return 1
-    res = posture.run_audit(hist, settings, raw, chosen, now, notifier=notifier, force_report=True)
+    res = posture.run_audit(hist, settings, raw, chosen, now, notifier=notifier, force_report=True, facts=facts)
     raw.clear()
     for name, fs in res["findings"].items():
         print(f"\n=== {name}: score {res['score'][name]}/100, {len(fs)} finding(s) ===")
@@ -347,6 +360,9 @@ def main(argv=None) -> int:
     g.add_argument("--audit", metavar="DEVICE|all", help="pull running-configs now and run the security audit (sends the report)")
     g.add_argument("--audit-fix", metavar="DEVICE", help="print a remediation script for a router's open findings")
     g.add_argument("--config-diff", metavar="N", nargs="?", const="4", help="show the last N recorded config changes with their diff")
+    g.add_argument("--accept", nargs=2, metavar=("DEVICE|all", "TITLE-TEXT"), help="accept open findings whose title contains TITLE-TEXT (known limitation); use with --reason")
+    g.add_argument("--unaccept", nargs=2, metavar=("DEVICE|all", "TITLE-TEXT"), help="undo --accept")
+    p.add_argument("--reason", default="", help="why a finding is accepted (with --accept)")
     g.add_argument("--approve", metavar="ID", help="approve and run a proposed fix (ID from the alert email)")
     g.add_argument("--reject", metavar="ID", help="reject a proposed fix")
     g.add_argument("--proposals", action="store_true", help="list recent proposed fixes and their status")
@@ -398,7 +414,7 @@ def main(argv=None) -> int:
         return 0
     if args.approve or args.reject or args.proposals:
         return cmd_actions(args, devices, settings, store, notifier)
-    if args.audit or args.audit_fix or args.config_diff:
+    if args.audit or args.audit_fix or args.config_diff or args.accept or args.unaccept:
         return cmd_audit(args, devices, settings, store, notifier)
     if args.report:
         hist = History(os.path.join(store.dir, "history.db"))

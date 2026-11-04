@@ -23,9 +23,12 @@ DEFAULTS = {"enabled": True, "notify_min_severity": "medium", "use_ai": True, "r
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS audit_findings (
   fingerprint TEXT PRIMARY KEY, device TEXT NOT NULL, rule TEXT NOT NULL, severity TEXT NOT NULL, title TEXT,
-  detail TEXT, evidence TEXT, fix TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, resolved_at TEXT);
+  detail TEXT, evidence TEXT, fix TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, resolved_at TEXT,
+  accepted_at TEXT, accepted_reason TEXT);
 CREATE INDEX IF NOT EXISTS audit_dev ON audit_findings(device, resolved_at);
 """
+MIGRATIONS = ["ALTER TABLE audit_findings ADD COLUMN accepted_at TEXT",
+              "ALTER TABLE audit_findings ADD COLUMN accepted_reason TEXT"]
 
 AI_SYSTEM = """You are a network security engineer writing a short note for an IT manager about the security
 posture of a few Cisco routers. You get the audit findings (rule, severity, title, evidence, fix commands)
@@ -41,37 +44,81 @@ def _cfg(settings: dict) -> dict:
 
 def ensure_schema(hist: History) -> None:
     hist.conn.executescript(SCHEMA)
+    cols = {r[1] for r in hist.conn.execute("PRAGMA table_info(audit_findings)")}
+    for stmt in MIGRATIONS:
+        if stmt.split("ADD COLUMN ")[1].split()[0] not in cols:
+            hist.conn.execute(stmt)
+    hist.conn.commit()
+
+
+def accept(hist: History, device: Optional[str], title_part: str, reason: str, now: datetime) -> list[dict]:
+    """Mark open findings whose title contains title_part as accepted (known limitation / risk accepted)."""
+    ensure_schema(hist)
+    q = "SELECT fingerprint, device, title FROM audit_findings WHERE resolved_at IS NULL AND accepted_at IS NULL AND title LIKE ?"
+    args: list = [f"%{title_part}%"]
+    if device and device != "all":
+        q += " AND device=?"
+        args.append(device)
+    rows = [dict(r) for r in hist.conn.execute(q, args).fetchall()]
+    with hist.conn:
+        for r in rows:
+            hist.conn.execute("UPDATE audit_findings SET accepted_at=?, accepted_reason=? WHERE fingerprint=?",
+                              (now.isoformat(timespec="seconds"), reason[:300], r["fingerprint"]))
+    return rows
+
+
+def unaccept(hist: History, device: Optional[str], title_part: str) -> int:
+    ensure_schema(hist)
+    q = "UPDATE audit_findings SET accepted_at=NULL, accepted_reason=NULL WHERE accepted_at IS NOT NULL AND title LIKE ?"
+    args: list = [f"%{title_part}%"]
+    if device and device != "all":
+        q += " AND device=?"
+        args.append(device)
+    with hist.conn:
+        return hist.conn.execute(q, args).rowcount
 
 
 def run_audit(hist: History, settings: dict, raw_configs: dict, devices: list, now: datetime, notifier=None,
-              client=None, force_report: bool = False) -> dict:
+              client=None, force_report: bool = False, facts: Optional[dict] = None) -> dict:
     """raw_configs: {device_name: raw running-config text}. Returns {"new":[], "open":[], "resolved":[], "score":{}}."""
     cfg = _cfg(settings)
     ensure_schema(hist)
     ts = now.isoformat(timespec="seconds")
     by_dev = {d.name: d for d in devices}
-    new, still_open, resolved, scores, all_now = [], [], [], {}, {}
+    new, still_open, resolved, accepted, scores, all_now = [], [], [], [], {}, {}
     for name, raw in raw_configs.items():
         dv = by_dev.get(name)
         findings = audit_config(raw, name, [dv.interface] if dv else ["GigabitEthernet0/0"],
-                                monitor_user=dv.username if dv else "")
+                                monitor_user=dv.username if dv else "", facts=(facts or {}).get(name))
         all_now[name] = findings
-        scores[name] = score(findings)
+        acc_fps = {r["fingerprint"] for r in hist.conn.execute(
+            "SELECT fingerprint FROM audit_findings WHERE device=? AND accepted_at IS NOT NULL", (name,))}
+        scores[name] = score([f for f in findings if f.fingerprint not in acc_fps])
         seen = {f.fingerprint for f in findings}
         with hist.conn:
             for f in findings:
-                row = hist.conn.execute("SELECT first_seen, resolved_at FROM audit_findings WHERE fingerprint=?",
+                row = hist.conn.execute("SELECT first_seen, resolved_at, accepted_at FROM audit_findings WHERE fingerprint=?",
                                         (f.fingerprint,)).fetchone()
                 if row and not row["resolved_at"]:
                     hist.conn.execute("UPDATE audit_findings SET last_seen=? WHERE fingerprint=?", (ts, f.fingerprint))
-                    still_open.append(f)
+                    if row["accepted_at"]:
+                        accepted.append(f)
+                    else:
+                        still_open.append(f)
                 else:
+                    # Same router + rule + title previously accepted (evidence may have changed, e.g. secret 5 -> 9):
+                    # the acceptance carries over instead of re-opening it as "new".
+                    prior = hist.conn.execute("SELECT accepted_at, accepted_reason FROM audit_findings WHERE device=? AND rule=? "
+                                              "AND title=? AND accepted_at IS NOT NULL ORDER BY last_seen DESC LIMIT 1",
+                                              (name, f.rule, f.title)).fetchone()
                     hist.conn.execute("INSERT INTO audit_findings (fingerprint,device,rule,severity,title,detail,evidence,fix,"
-                                      "first_seen,last_seen,resolved_at) VALUES (?,?,?,?,?,?,?,?,?,?,NULL) "
-                                      "ON CONFLICT(fingerprint) DO UPDATE SET first_seen=excluded.first_seen, last_seen=excluded.last_seen, resolved_at=NULL",
+                                      "first_seen,last_seen,resolved_at,accepted_at,accepted_reason) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?) "
+                                      "ON CONFLICT(fingerprint) DO UPDATE SET first_seen=excluded.first_seen, last_seen=excluded.last_seen, "
+                                      "resolved_at=NULL, accepted_at=excluded.accepted_at, accepted_reason=excluded.accepted_reason",
                                       (f.fingerprint, name, f.rule, f.severity, f.title, f.detail, json.dumps(f.evidence),
-                                       json.dumps(f.fix), ts, ts))
-                    new.append(f)
+                                       json.dumps(f.fix), ts, ts, prior["accepted_at"] if prior else None,
+                                       prior["accepted_reason"] if prior else None))
+                    (accepted if prior else new).append(f)
             for r in hist.conn.execute("SELECT * FROM audit_findings WHERE device=? AND resolved_at IS NULL", (name,)).fetchall():
                 if r["fingerprint"] not in seen:
                     hist.conn.execute("UPDATE audit_findings SET resolved_at=? WHERE fingerprint=?", (ts, r["fingerprint"]))
@@ -103,17 +150,18 @@ def run_audit(hist: History, settings: dict, raw_configs: dict, devices: list, n
         story = None
         if cfg["use_ai"] and settings.get("ai", {}).get("enabled"):
             story = _narrative(new, still_open, resolved, settings["ai"], client)
-        subject, body, text = render(new, still_open, resolved, scores, now, story)
+        subject, body, text = render(new, still_open, resolved, scores, now, story, accepted)
         notifier.send_report(subject, body, text)
         hist.set_meta("audit:last_report", ts)
-    return {"new": new, "open": still_open, "resolved": resolved, "score": scores, "findings": all_now}
+    return {"new": new, "open": still_open, "resolved": resolved, "accepted": accepted, "score": scores, "findings": all_now}
 
 
 def _reminder_due(hist: History, now: datetime, cfg: dict) -> bool:
     last = hist.get_meta("audit:last_report")
     if not last:
         return True
-    open_count = hist.conn.execute("SELECT COUNT(*) FROM audit_findings WHERE resolved_at IS NULL AND severity IN ('critical','high')").fetchone()[0]
+    open_count = hist.conn.execute("SELECT COUNT(*) FROM audit_findings WHERE resolved_at IS NULL AND accepted_at IS NULL "
+                                   "AND severity IN ('critical','high')").fetchone()[0]
     return open_count > 0 and (now - datetime.fromisoformat(last)) >= timedelta(days=int(cfg["remind_days"]))
 
 
@@ -132,9 +180,10 @@ def _narrative(new, still_open, resolved, cfg_ai: dict, client=None) -> Optional
         return None
 
 
-def open_findings(hist: History, device: Optional[str] = None) -> list[dict]:
+def open_findings(hist: History, device: Optional[str] = None, include_accepted: bool = False) -> list[dict]:
     ensure_schema(hist)
-    q = "SELECT * FROM audit_findings WHERE resolved_at IS NULL" + (" AND device=?" if device else "")
+    q = ("SELECT * FROM audit_findings WHERE resolved_at IS NULL" + ("" if include_accepted else " AND accepted_at IS NULL")
+         + (" AND device=?" if device else ""))
     rows = hist.conn.execute(q, (device,) if device else ()).fetchall()
     out = [dict(r) for r in rows]
     for r in out:
@@ -152,7 +201,7 @@ def summary(hist: History, device: str) -> dict:
             "open": counts, "top": [f"[{r['severity']}] {r['title']}" for r in rows[:4]]}
 
 
-def render(new, still_open, resolved, scores: dict, now: datetime, story: Optional[str]) -> tuple[str, str, str]:
+def render(new, still_open, resolved, scores: dict, now: datetime, story: Optional[str], accepted=()) -> tuple[str, str, str]:
     esc = html.escape
     crit_high_new = sum(SEV_ORDER[f.severity] <= 1 for f in new)
     worst = min(scores.values(), default=100)
@@ -185,7 +234,9 @@ def render(new, still_open, resolved, scores: dict, now: datetime, story: Option
             f"<h3>New ({len(new)})</h3>{table(new, True)}"
             f"<h3>Resolved ({len(resolved)})</h3>{table(resolved, False)}"
             f"<h3>Still open ({len(still_open)})</h3>{table(still_open, False)}"
-            "<p style='color:#888;font-size:12px'>Fix commands use &lt;PLACEHOLDERS&gt; - never paste them blindly; apply in a "
+            + (f"<p style='color:#666'>Accepted / known limitations: {len(accepted)} "
+               f"({', '.join(sorted({f.title for f in accepted}))}) - not counted in the score.</p>" if accepted else "")
+            + "<p style='color:#888;font-size:12px'>Fix commands use &lt;PLACEHOLDERS&gt; - never paste them blindly; apply in a "
             "maintenance window with a second session open. <code>--audit-fix &lt;router&gt;</code> prints a full script.</p></div>")
 
     lines = [f"Cisco security audit - {now.strftime('%d %b %Y %H:%M')}", ""]
@@ -194,7 +245,9 @@ def render(new, still_open, resolved, scores: dict, now: datetime, story: Option
     lines += [f"{d}: score {s}/100, {sum(1 for f in still_open + new if f.device == d)} open" for d, s in sorted(scores.items())]
     for label, items in (("NEW", new), ("RESOLVED", resolved), ("STILL OPEN", still_open)):
         lines += ["", f"{label} ({len(items)})"] + [f"  [{f.severity.upper():8}] {f.device}: {f.title}" for f in items]
+    if accepted:
+        lines += ["", f"ACCEPTED ({len(accepted)}): " + ", ".join(sorted({f.title for f in accepted}))]
     return subject, body, "\n".join(lines)
 
 
-__all__ = ["run_audit", "open_findings", "summary", "render", "fix_script"]
+__all__ = ["run_audit", "open_findings", "summary", "render", "fix_script", "accept", "unaccept"]

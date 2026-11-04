@@ -698,11 +698,24 @@ def test_backup_normalise_redacts_and_diffs(tmp_path):
     assert backup_mod.is_due(h, DEFAULT_SETTINGS, T0 + timedelta(days=3))                # 08:00 next day > hour 3
 
 
+SHOW_IP_SSH_1921 = """SSH Enabled - version 2.0
+Authentication methods:publickey,keyboard-interactive,password
+Hostkey Algorithms:x509v3-ssh-rsa,ssh-rsa
+Encryption Algorithms:aes128-ctr,aes192-ctr,aes256-ctr
+MAC Algorithms:hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha1-96
+KEX Algorithms:diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1
+Authentication timeout: 60 secs; Authentication retries: 2
+Minimum expected Diffie Hellman key size : 2048 bits
+"""
+
+
 class FakeCfgConn:
-    def __init__(self, cfg):
-        self.cfg = cfg
+    def __init__(self, cfg, ssh=SHOW_IP_SSH_1921):
+        self.cfg, self.ssh = cfg, ssh
 
     def send_command(self, cmd, read_timeout=None):
+        if cmd == "show ip ssh":
+            return self.ssh
         assert cmd == "show running-config"
         return self.cfg
 
@@ -1182,3 +1195,60 @@ def test_fix_script_warns_about_monitor_account():
     acct = next(f for f in fs if f.rule == "accounts" and "admin" in f.title)
     assert any("THIS MONITOR" in x for x in acct.fix) and acct.fix[-2] == "no username admin"
     assert "the monitor's own login" in acct.detail
+
+
+def test_ssh_findings_come_from_show_ip_ssh_not_guesses():
+    # no facts -> no DH/KEX finding at all (config cannot show defaults)
+    fs = audit_mod.audit_config(HARDENED_CFG, "r1")
+    assert not any("Diffie" in f.title or "key exchange" in f.title for f in fs)
+    # real 1921 output: DH already 2048 -> no DH finding; sha1-only KEX -> one low finding
+    fs = audit_mod.audit_config(HARDENED_CFG, "r1", facts={"ssh": SHOW_IP_SSH_1921})
+    titles = [f.title for f in fs]
+    assert not any("Diffie" in t for t in titles)
+    kex = [f for f in fs if "SHA-1 methods only" in f.title]
+    assert len(kex) == 1 and kex[0].severity == "low" and "IOS upgrade" in kex[0].detail
+    # weak DH reported when the router says so
+    fs = audit_mod.audit_config(HARDENED_CFG, "r1", facts={"ssh": SHOW_IP_SSH_1921.replace("2048 bits", "1024 bits")})
+    assert any(f.title == "SSH Diffie-Hellman minimum is 1024 bits" for f in fs)
+
+
+def test_backup_collects_facts_for_audit(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    raw, facts = {}, {}
+    backup_mod.run([DEV], DEFAULT_SETTINGS, h, T0, connect=lambda d, t: FakeCfgConn(HARDENED_CFG), force=True, raw_out=raw, facts_out=facts)
+    assert "KEX Algorithms" in facts[DEV.name]["ssh"]
+    res = posture_mod.run_audit(h, DEFAULT_SETTINGS, raw, [DEV], T0, facts=facts)
+    assert any("SHA-1 methods only" in f.title for f in res["findings"][DEV.name])
+
+
+def test_accepted_findings_leave_score_and_reports(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    n = ReportCapture()
+    facts = {DEV.name: {"ssh": SHOW_IP_SSH_1921}}
+    r1 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], T0, notifier=n, facts=facts)
+    base = r1["score"][DEV.name]
+    assert any("SHA-1" in f.title for f in r1["new"])
+    rows = posture_mod.accept(h, "all", "SHA-1 methods only", "1921 IOS limitation", T0)
+    assert len(rows) == 1
+    r2 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], T0 + timedelta(days=1), notifier=n,
+                               facts=facts, force_report=True)
+    assert r2["score"][DEV.name] == base + 1 and len(r2["accepted"]) == 1
+    assert not any("SHA-1" in f.title for f in r2["open"] + r2["new"])
+    assert "ACCEPTED (1)" in n.reports[-1][2] and "not counted in the score" in n.reports[-1][1]
+    assert not any("SHA-1" in r["title"] for r in posture_mod.open_findings(h, DEV.name))
+    assert posture_mod.unaccept(h, "all", "SHA-1") == 1
+    r3 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], T0 + timedelta(days=2), facts=facts)
+    assert any("SHA-1" in f.title for f in r3["open"])
+
+
+def test_acceptance_survives_evidence_change(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    cfg5 = HARDENED_CFG.replace("username danang privilege 15 algorithm-type scrypt secret 9 $9$def",
+                                "username admin privilege 15 secret 5 $1$abc")
+    cfg9 = cfg5.replace("secret 5 $1$abc", "secret 9 $9$abc")
+    posture_mod.run_audit(h, DEFAULT_SETTINGS, {DEV.name: cfg5}, [DEV], T0)
+    assert posture_mod.accept(h, "all", "Default-style account name", "shared by apps", T0)
+    r = posture_mod.run_audit(h, DEFAULT_SETTINGS, {DEV.name: cfg9}, [DEV], T0 + timedelta(days=1))
+    assert not any("admin" in f.title for f in r["new"] + r["open"])
+    assert any("admin" in f.title for f in r["accepted"])
+    assert any("MD5" in f.title for f in r["resolved"])      # the real change is still reported

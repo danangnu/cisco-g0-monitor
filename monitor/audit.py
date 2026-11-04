@@ -195,10 +195,7 @@ def r_exec_timeout(c: Config, ctx: dict):
             out.append(_f("exec_timeout", "medium", f"{h}: exec-timeout 0 0 (sessions never expire)",
                           "An idle admin session stays logged in forever - a left-open terminal is a privileged session for anyone.",
                           [h, " exec-timeout 10 0", "write memory"], [f"{h} / exec-timeout 0 0"]))
-        elif not et and h.startswith("line vty"):
-            out.append(_f("exec_timeout", "low", f"{h}: no explicit exec-timeout",
-                          "Default is 10 minutes on most IOS, but set it explicitly so it survives upgrades and audits.",
-                          [h, " exec-timeout 10 0", "write memory"], [h]))
+        # No exec-timeout line means the IOS default (10 min), which is fine - IOS hides default values.
     return out
 
 
@@ -263,12 +260,24 @@ def r_ssh(c: Config, ctx: dict):
         out.append(_f("ssh", "medium", "SSH version 2 not enforced",
                       "Without `ip ssh version 2` the router may still negotiate SSHv1 with old clients.",
                       ["ip ssh version 2", "write memory"]))
-    m = c.top(r"^ip ssh dh min size")
-    if not m or int(re.search(r"(\d+)$", m[0]).group(1)) < 2048:
-        out.append(_f("ssh", "low", "SSH Diffie-Hellman minimum below 2048 bits",
-                      "Allows weak 1024-bit key exchange (this is also why modern SSH clients refuse to connect).",
-                      ["crypto key generate rsa modulus 2048", "ip ssh dh min size 2048",
-                       "! on IOS 15.5+ also: ip ssh server algorithm kex diffie-hellman-group14-sha1", "write memory"], m))
+    # DH size and key-exchange come from `show ip ssh` (IOS hides defaults in the config, so the config alone can't tell).
+    facts = (ctx.get("facts") or {}).get("ssh") or ""
+    m = re.search(r"Minimum expected Diffie Hellman key size\s*:\s*(\d+)", facts)
+    if m and int(m.group(1)) < 2048:
+        out.append(_f("ssh", "low", f"SSH Diffie-Hellman minimum is {m.group(1)} bits",
+                      "Allows a weak 1024-bit key exchange.",
+                      ["crypto key generate rsa modulus 2048", "ip ssh dh min size 2048", "write memory"],
+                      [f"show ip ssh: Minimum expected Diffie Hellman key size : {m.group(1)} bits"]))
+    k = re.search(r"KEX Algorithms:\s*(.+)", facts)
+    if k and not re.search(r"sha256|sha512|curve25519|ecdh", k.group(1)):
+        out.append(_f("ssh", "low", "SSH key exchange offers SHA-1 methods only",
+                      "This IOS only offers diffie-hellman-*-sha1 key exchange, which current SSH clients (OpenSSH 9+, paramiko 5+) "
+                      "refuse by default. It is a limitation of the IOS image, not a setting: check whether stronger methods exist "
+                      "with `ip ssh server algorithm kex ?`; if only sha1 is listed, the fix is an IOS upgrade or a newer router. "
+                      "The monitor pins an SSH library that still accepts these methods.",
+                      ["! check: ip ssh server algorithm kex ?", "! if a sha256 option exists:",
+                       "ip ssh server algorithm kex diffie-hellman-group14-sha256", "write memory"],
+                      [f"show ip ssh: KEX Algorithms: {k.group(1).strip()}"]))
     if not c.has(r"^login block-for"):
         out.append(_f("ssh", "low", "No login brute-force protection (login block-for)",
                       "Unlimited password guesses over SSH.",
@@ -378,9 +387,10 @@ def r_accounts(c: Config, ctx: dict):
 
 # --------------------------------------------------------------------------- run
 def audit_config(raw_config: str, device: str, wan_interfaces: Iterable[str] = ("GigabitEthernet0/0",),
-                 monitor_user: str = "") -> list[Finding]:
+                 monitor_user: str = "", facts: Optional[dict] = None) -> list[Finding]:
+    """facts: optional read-only command output that the config alone cannot show, e.g. {"ssh": <show ip ssh>}."""
     c = Config(raw_config)
-    ctx = {"wan_interfaces": list(wan_interfaces), "monitor_user": monitor_user}
+    ctx = {"wan_interfaces": list(wan_interfaces), "monitor_user": monitor_user, "facts": facts or {}}
     findings: list[Finding] = []
     for rid, fn in RULES:
         try:

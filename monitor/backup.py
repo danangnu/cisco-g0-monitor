@@ -49,11 +49,22 @@ def diff_configs(old: str, new: str, max_lines: int) -> tuple[str, int, int]:
     return text, added, removed
 
 
-def fetch_config(device: Device, settings: dict, connect: Optional[Callable] = None) -> str:
+FACT_COMMANDS = {"ssh": "show ip ssh"}   # read-only facts the audit needs that the config does not show
+
+
+def fetch_config(device: Device, settings: dict, connect: Optional[Callable] = None,
+                 facts_out: Optional[dict] = None) -> str:
     connect = connect or _default_connect
     conn = connect(device, settings["ssh_timeout"])
     try:
-        return conn.send_command("show running-config", read_timeout=90)
+        raw = conn.send_command("show running-config", read_timeout=90)
+        if facts_out is not None:
+            for key, cmd in FACT_COMMANDS.items():
+                try:
+                    facts_out[key] = conn.send_command(cmd, read_timeout=30)
+                except Exception as e:  # noqa: BLE001 - facts are optional
+                    facts_out[key] = f"(command failed: {type(e).__name__})"
+        return raw
     finally:
         try:
             conn.disconnect()
@@ -69,7 +80,8 @@ def is_due(hist: History, settings: dict, now: datetime) -> bool:
 
 
 def run(devices: list[Device], settings: dict, hist: History, now: datetime,
-        connect: Optional[Callable] = None, force: bool = False, raw_out: Optional[dict] = None) -> list[Event]:
+        connect: Optional[Callable] = None, force: bool = False, raw_out: Optional[dict] = None,
+        facts_out: Optional[dict] = None) -> list[Event]:
     """Back up every router. Returns CONFIG_CHANGED events (first snapshot = info, later changes = warning)."""
     cfg = {**DEFAULTS, **(settings.get("backup") or {})}
     if not force and not cfg["enabled"]:
@@ -79,9 +91,12 @@ def run(devices: list[Device], settings: dict, hist: History, now: datetime,
 
     def one(dv: Device):
         try:
-            raw = fetch_config(dv, settings, connect)
+            facts: dict = {}
+            raw = fetch_config(dv, settings, connect, facts_out=facts if raw_out is not None else None)
             if raw_out is not None and raw and len(raw) >= 50:
                 raw_out[dv.name] = raw          # for the security audit; never stored or logged unredacted
+                if facts_out is not None:
+                    facts_out[dv.name] = facts
             return dv, normalise(raw), None
         except Exception as e:  # noqa: BLE001
             return dv, None, f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"[:200]

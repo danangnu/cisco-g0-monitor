@@ -198,6 +198,14 @@ docker compose run --rm cisco-g0-monitor --audit all          # audit now and em
 docker compose run --rm cisco-g0-monitor --audit-fix rtr-143  # print a remediation script for one router
 ```
 
+A finding you cannot fix (an IOS limitation, an accepted risk) can be taken out of the score and the
+reminders without losing the record:
+
+```bash
+docker compose run --rm cisco-g0-monitor --accept all "SHA-1 methods only" --reason "1921 IOS cannot offer sha256 kex"
+docker compose run --rm cisco-g0-monitor --unaccept all "SHA-1 methods only"
+```
+
 The fix script is a starting point, not a button: review it, fill in the placeholders, keep a second
 session open while changing vty/ACL/SSH settings, and apply it in a maintenance window.
 
