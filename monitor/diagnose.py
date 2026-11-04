@@ -82,15 +82,23 @@ def find_gateway(text: str) -> Optional[str]:
             except ValueError:
                 continue
     return None
+# Keeps the password *type* digit (0 = plaintext, 5 = MD5, 7 = reversible, 8/9 = strong) so that
+# config diffs and the security audit can still tell them apart; the value itself is dropped.
 _REDACT_RES = [
-    re.compile(r"(?i)\b(password|secret|key|community|psk|token)(\s+\d)?\s+\S+"),
-    re.compile(r"(?i)\b(username\s+\S+\s+(?:privilege\s+\d+\s+)?(?:password|secret))\s+\S+"),
+    # "<keyword> [type] <value>" forms
+    re.compile(r"(?i)\b(message-digest-key\s+\d+\s+md5|key-string|password|secret|community|psk|token|"
+               r"isakmp key|authentication-key)(\s+\d)?\s+\S+"),
+    # "key <value>" at the end of a line (tacacs/radius/ipsec), and "... key <value>" after an address
+    re.compile(r"(?i)(^\s*key(\s+\d)?\s+)\S+\s*$", re.M),
+    re.compile(r"(?i)(\baddress\s+\S+\s+key\s+)\S+"),
 ]
 
 
+
 def redact(text: str) -> str:
-    for rx in _REDACT_RES:
-        text = rx.sub(lambda m: m.group(1) + " [REDACTED]", text)
+    text = _REDACT_RES[0].sub(lambda m: m.group(1) + (m.group(2) or "") + " [REDACTED]", text)
+    text = _REDACT_RES[1].sub(lambda m: m.group(1).rstrip() + " [REDACTED]", text)
+    text = _REDACT_RES[2].sub(lambda m: m.group(1) + "[REDACTED]", text)
     return text
 
 

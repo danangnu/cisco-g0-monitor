@@ -195,12 +195,21 @@ class History:
                            "avg_last_24h": round(statistics.mean(lat_24h)) if lat_24h else None},
             "ping_success_last_24h_percent": self.loss(device, now - timedelta(days=1)),
             "subnet_changes": [{"at": s["started_at"][:16], "detail": s["detail"][:120]} for s in subnet_changes],
+            "security_posture": self._posture(device),
             "config": None if not cfg else {
                 "last_backup": cfg["ts"][:16], "lines": cfg["lines"],
                 "recent_changes": [{"at": c["ts"][:16], "added": c["added"], "removed": c["removed"]} for c in changes],
             },
         }
         return out
+
+    def _posture(self, device: str) -> Optional[dict]:
+        try:
+            from .posture import summary
+            p = summary(self, device)
+            return p if p.get("score") is not None else None
+        except Exception:  # noqa: BLE001
+            return None
 
     def fleet_summary(self, devices: list[str], now: datetime, days: int = 7) -> dict:
         return {d: self.summary_for(d, now, days) for d in devices}

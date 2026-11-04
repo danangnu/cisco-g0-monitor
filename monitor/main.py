@@ -10,6 +10,8 @@ Usage:
   python -m monitor.main --history all   # incident history, uptime, latency trend
   python -m monitor.main --backup        # back up running-configs now, report diffs
   python -m monitor.main --report        # send the weekly report now
+  python -m monitor.main --audit all     # security audit of running-configs, emails the report
+  python -m monitor.main --audit-fix rtr-143   # remediation script for one router
   python -m monitor.main --proposals     # list proposed fixes
   python -m monitor.main --approve A7K3  # run a proposed fix after re-checking the fault
   python -m monitor.main --reject A7K3
@@ -27,7 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from . import actions, backup, report, trends
+from . import actions, backup, posture, report, trends
 from .collector import _default_connect, check_device
 from .diagnose import diagnose_cycle
 from .history import History
@@ -77,10 +79,18 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
 
     # Stage 2: daily config backup (runs inside the cycle after the configured hour, once per day)
     if backup.is_due(hist, settings, now):
+        raw_configs: dict = {}
         try:
-            all_events += backup.run(active, settings, hist, now, connect=connect)
+            all_events += backup.run(active, settings, hist, now, connect=connect, raw_out=raw_configs)
         except Exception:  # noqa: BLE001
             log.exception("Config backup failed")
+        # Stage 4: security audit of today's configs (report only when something changed)
+        if raw_configs and settings.get("audit", {}).get("enabled", True):
+            try:
+                posture.run_audit(hist, settings, raw_configs, active, now, notifier=notifier, client=ai_client)
+            except Exception:  # noqa: BLE001
+                log.exception("Security audit failed")
+        raw_configs.clear()
 
     # Stage 3: expire old proposals / drop ones whose router recovered by itself
     try:
@@ -234,6 +244,53 @@ def cmd_actions(args, devices, settings, store: StateStore, notifier: Notifier) 
     return 0 if p["status"] in ("succeeded", "not_needed") else 2
 
 
+def cmd_audit(args, devices, settings, store: StateStore, notifier: Notifier) -> int:
+    from .audit import fix_script, Finding
+    hist = History(os.path.join(store.dir, "history.db"))
+    now = datetime.now().astimezone()
+    if args.audit_fix:
+        rows = posture.open_findings(hist, args.audit_fix)
+        if not rows:
+            print(f"No open findings for {args.audit_fix!r} (run --audit first, or the router is clean).")
+            return 0
+        fs = [Finding(r["rule"], r["severity"], r["title"], r["detail"], r["fix"], r["evidence"], r["device"]) for r in rows]
+        print(fix_script(fs, args.audit_fix))
+        return 0
+    if args.config_diff:
+        rows = hist.conn.execute("SELECT device, ts, added, removed, diff FROM configs WHERE diff IS NOT NULL "
+                                 "ORDER BY id DESC LIMIT ?", (int(args.config_diff),)).fetchall()
+        for r in rows:
+            print(f"=== {r['device']} {r['ts'][:16].replace('T', ' ')}  +{r['added']}/-{r['removed']} ===\n{r['diff']}\n")
+        print("no config changes recorded" if not rows else "")
+        return 0
+    chosen = [d for d in devices if d.enabled] if args.audit == "all" else [d for d in devices if d.name in args.audit.split(",")]
+    if not chosen:
+        print(f"Unknown device(s) {args.audit!r}. Known: {', '.join(d.name for d in devices)}")
+        return 1
+    print(f"Pulling running-config from {len(chosen)} router(s)...")
+    raw: dict = {}
+    backup.run(chosen, settings, hist, now, force=True, raw_out=raw)   # also stores today's snapshot/diff
+    missing = [d.name for d in chosen if d.name not in raw]
+    if missing:
+        print(f"Could not fetch: {', '.join(missing)}")
+    if not raw:
+        return 1
+    res = posture.run_audit(hist, settings, raw, chosen, now, notifier=notifier, force_report=True)
+    raw.clear()
+    for name, fs in res["findings"].items():
+        print(f"\n=== {name}: score {res['score'][name]}/100, {len(fs)} finding(s) ===")
+        for f in fs:
+            tag = "NEW" if f in res["new"] else "   "
+            print(f"  {tag} [{f.severity.upper():8}] {f.title}")
+    if res["resolved"]:
+        print("\nResolved since last audit:")
+        for f in res["resolved"]:
+            print(f"  [{f.severity.upper():8}] {f.device}: {f.title}")
+    print(f"\nReport sent via: {', '.join(notifier.channels()) or 'nothing (no channels enabled)'}. "
+          f"Use --audit-fix <router> for a remediation script.")
+    return 0
+
+
 def cmd_history(target: str, devices, store: StateStore, days: int = 30) -> int:
     hist = History(os.path.join(store.dir, "history.db"))
     now = datetime.now().astimezone()
@@ -287,6 +344,9 @@ def main(argv=None) -> int:
     g.add_argument("--history", metavar="DEVICE|all", help="print incident history and trends from history.db")
     g.add_argument("--backup", action="store_true", help="back up all running-configs now and report changes")
     g.add_argument("--report", action="store_true", help="build and send the weekly report now")
+    g.add_argument("--audit", metavar="DEVICE|all", help="pull running-configs now and run the security audit (sends the report)")
+    g.add_argument("--audit-fix", metavar="DEVICE", help="print a remediation script for a router's open findings")
+    g.add_argument("--config-diff", metavar="N", nargs="?", const="4", help="show the last N recorded config changes with their diff")
     g.add_argument("--approve", metavar="ID", help="approve and run a proposed fix (ID from the alert email)")
     g.add_argument("--reject", metavar="ID", help="reject a proposed fix")
     g.add_argument("--proposals", action="store_true", help="list recent proposed fixes and their status")
@@ -338,6 +398,8 @@ def main(argv=None) -> int:
         return 0
     if args.approve or args.reject or args.proposals:
         return cmd_actions(args, devices, settings, store, notifier)
+    if args.audit or args.audit_fix or args.config_diff:
+        return cmd_audit(args, devices, settings, store, notifier)
     if args.report:
         hist = History(os.path.join(store.dir, "history.db"))
         out = report.run(hist, [d for d in devices if d.enabled], settings, datetime.now().astimezone(), notifier)

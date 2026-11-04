@@ -65,6 +65,7 @@ def build_stats(hist: History, devices: list, now: datetime, days: int) -> list[
             "latency": s["latency_ms"]["avg_last_24h"], "latency_prev": s["latency_ms"]["avg_prev_7d"],
             "ping_ok": s["ping_success_last_24h_percent"],
             "config_changes": len(s["config"]["recent_changes"]) if s["config"] else 0,
+            "security": s.get("security_posture"),
             "subnet_changes": len(s["subnet_changes"]),
             "by_hour": s["incidents_by_hour_of_day"],
             "recent": s["recent_incidents"],
@@ -105,6 +106,13 @@ def render(stats: list[dict], story: Optional[dict], now: datetime, days: int) -
     def fmt(v, suffix=""):
         return "-" if v is None else f"{v}{suffix}"
 
+    def sec(s):
+        p = s.get("security")
+        if not p:
+            return "-"
+        o = p["open"]
+        return f"{p['score']}/100 ({o['critical']}C {o['high']}H {o['medium']}M {o['low']}L)"
+
     def lat(s):
         if s["latency"] is None:
             return "-"
@@ -117,7 +125,7 @@ def render(stats: list[dict], story: Optional[dict], now: datetime, days: int) -
     trs = "".join(
         f"<tr><td>{html.escape(s['device'])}</td><td>{fmt(s['uptime'], '%')}</td><td>{s['incidents']}</td>"
         f"<td>{html.escape(s['downtime'])}</td><td>{html.escape(s['longest'])}</td><td>{html.escape(lat(s))}</td>"
-        f"<td>{fmt(s['ping_ok'], '%')}</td><td>{s['config_changes']}</td></tr>"
+        f"<td>{fmt(s['ping_ok'], '%')}</td><td>{s['config_changes']}</td><td>{sec(s)}</td></tr>"
         for s in stats)
     story_html = ""
     if story:
@@ -132,7 +140,7 @@ def render(stats: list[dict], story: Optional[dict], now: datetime, days: int) -
             f"GigabitEthernet0/0 checked every 5 minutes</p>{story_html}"
             f"<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse'>"
             f"<thead><tr><th>Router</th><th>Uptime</th><th>Outages</th><th>Downtime</th><th>Longest</th>"
-            f"<th>Latency (24h)</th><th>Ping OK (24h)</th><th>Config changes</th></tr></thead><tbody>{trs}</tbody></table>"
+            f"<th>Latency (24h)</th><th>Ping OK (24h)</th><th>Config changes</th><th>Security</th></tr></thead><tbody>{trs}</tbody></table>"
             f"<p style='color:#888;font-size:12px'>Uptime = share of checks with internet reachable from G0/0. "
             f"Latency arrows compare the last 24h with the previous week.</p></div>")
 
@@ -142,10 +150,10 @@ def render(stats: list[dict], story: Optional[dict], now: datetime, days: int) -
         if story.get("recommendations"):
             lines += ["", "Recommended this week:"] + [f"{i}. {x}" for i, x in enumerate(story["recommendations"], 1)]
         lines.append("")
-    lines.append(f"{'ROUTER':14} {'UPTIME':>7} {'OUTAGES':>8} {'DOWNTIME':>9} {'LATENCY':>10} {'PING OK':>8} {'CFG':>4}")
+    lines.append(f"{'ROUTER':14} {'UPTIME':>7} {'OUTAGES':>8} {'DOWNTIME':>9} {'LATENCY':>10} {'PING OK':>8} {'CFG':>4}  SECURITY")
     for s in stats:
         lines.append(f"{s['device']:14} {fmt(s['uptime'], '%'):>7} {s['incidents']:>8} {s['downtime']:>9} "
-                     f"{lat(s):>10} {fmt(s['ping_ok'], '%'):>8} {s['config_changes']:>4}")
+                     f"{lat(s):>10} {fmt(s['ping_ok'], '%'):>8} {s['config_changes']:>4}  {sec(s)}")
     return subject, body, "\n".join(lines)
 
 

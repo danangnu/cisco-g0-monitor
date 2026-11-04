@@ -1,6 +1,6 @@
 # cisco-g0-monitor
 
-Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, proposes fixes you approve with one command, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
+Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, proposes fixes you approve with one command, audits router security daily, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
 
 | Event | Severity | When |
 |---|---|---|
@@ -171,6 +171,39 @@ docker compose run --rm cisco-g0-monitor --reject BTHW
 
 Set `actions.enabled: false` to go back to diagnose-only.
 
+## Security audit (Stage 4 of the agent)
+
+Right after the daily config backup, every router's running-config is checked against ~25 rules:
+
+| Area | Examples |
+|---|---|
+| Credentials | `enable password` instead of `secret`, type-7 (reversible) and type-0 (cleartext) passwords, MD5 secrets, `service password-encryption` off |
+| Management plane | Telnet on vty lines, no `access-class`, `exec-timeout 0 0`, AUX exec, HTTP/HTTPS server, missing `ip ssh version 2`, weak DH size, no login block |
+| SNMP | RW communities, default/short community strings, v2c without ACL |
+| Legacy services | tcp/udp small-servers, finger, bootp, pad, identd, IP source routing |
+| WAN interface | no inbound ACL, CDP, redirects/unreachables/proxy-arp, directed broadcast |
+| Operations | no syslog host, no timestamps, no NTP, default account names, no AAA, no banner |
+
+Each finding has a severity, the offending line (secrets redacted, password *type* kept), a plain
+explanation and the exact IOS commands to fix it, with `<PLACEHOLDERS>` for anything secret.
+A posture score (100 = clean; critical -25, high -10, medium -4, low -1) is tracked per router,
+shown in the weekly report and given to Claude as context when diagnosing an outage.
+
+An audit email goes out only when something changed: new findings (at or above
+`audit.notify_min_severity`), resolved findings, or every `remind_days` while critical/high items
+stay open. Claude adds a short "what to fix first and why" note on top.
+
+```bash
+docker compose run --rm cisco-g0-monitor --audit all          # audit now and email the report
+docker compose run --rm cisco-g0-monitor --audit-fix rtr-143  # print a remediation script for one router
+```
+
+The fix script is a starting point, not a button: review it, fill in the placeholders, keep a second
+session open while changing vty/ACL/SSH settings, and apply it in a maintenance window.
+
+The raw config is only ever held in memory for the audit; what is stored (`history.db`) and emailed is
+redacted. Nothing in the audit changes router configuration.
+
 ## How email is sent (TrackIT, same as Teltonika)
 
 The monitor does not talk to a mail server. Like `trackitDeviceFaultAlert.ts` in the Teltonika SMS Console, it inserts one row per recipient into TrackIT's `logbulkmail` table and TrackIT's mailer sends it:
@@ -262,8 +295,10 @@ monitor/
   backup.py      Stage 2: daily running-config backup + diff
   report.py      Stage 2: weekly report
   actions.py     Stage 3: fix catalogue, proposals, approved execution with verification
+  audit.py       Stage 4: IOS config security rules, scoring, remediation script
+  posture.py     Stage 4: finding lifecycle (new/open/resolved), audit report
   state.py       state.json, events.jsonl, heartbeat
-  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report, --proposals, --approve, --reject)
+  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report, --proposals, --approve, --reject, --audit, --audit-fix)
   healthcheck.py Docker HEALTHCHECK
 tests/           pytest suite with simulated IOS / IOS-XE output
 ```

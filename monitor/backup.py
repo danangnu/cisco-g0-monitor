@@ -69,7 +69,7 @@ def is_due(hist: History, settings: dict, now: datetime) -> bool:
 
 
 def run(devices: list[Device], settings: dict, hist: History, now: datetime,
-        connect: Optional[Callable] = None, force: bool = False) -> list[Event]:
+        connect: Optional[Callable] = None, force: bool = False, raw_out: Optional[dict] = None) -> list[Event]:
     """Back up every router. Returns CONFIG_CHANGED events (first snapshot = info, later changes = warning)."""
     cfg = {**DEFAULTS, **(settings.get("backup") or {})}
     if not force and not cfg["enabled"]:
@@ -79,7 +79,10 @@ def run(devices: list[Device], settings: dict, hist: History, now: datetime,
 
     def one(dv: Device):
         try:
-            return dv, normalise(fetch_config(dv, settings, connect)), None
+            raw = fetch_config(dv, settings, connect)
+            if raw_out is not None and raw and len(raw) >= 50:
+                raw_out[dv.name] = raw          # for the security audit; never stored or logged unredacted
+            return dv, normalise(raw), None
         except Exception as e:  # noqa: BLE001
             return dv, None, f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"[:200]
 

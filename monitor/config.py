@@ -42,6 +42,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "backup": {"enabled": True, "hour": 3, "max_diff_lines": 80, "warn_on_change": True},
     "report": {"enabled": True, "weekday": 0, "hour": 8, "days": 7, "use_ai": True},
     "actions": {"enabled": True, "expire_hours": 4, "cooldown_hours": 6, "max_per_day": 4},
+    "audit": {"enabled": True, "notify_min_severity": "medium", "use_ai": True, "remind_days": 7},
     "notify": {
         "trackit": {"enabled": False, "db_host": "", "db_port": 3306, "db_user": "", "db_password": "",
                     "db_name": "trackitlive", "to": [], "from": "", "from_name": "Cisco G0/0 Monitor",

@@ -65,6 +65,14 @@ actions:
   cooldown_hours: 6                # same action on the same router at most once per 6h
   max_per_day: 4                   # hard cap on executed actions across the fleet per 24h
 
+# Stage 4: security audit of every router's running-config, run right after the daily backup.
+# Findings (with fix commands, never secrets) are emailed when something is new or resolved.
+audit:
+  enabled: true
+  notify_min_severity: medium      # email when a NEW finding is at least this severe (critical|high|medium|low)
+  remind_days: 7                   # re-send while critical/high findings stay open
+  use_ai: true                     # one Claude call per report for a plain-language priority note
+
 notify:
   # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
   # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.

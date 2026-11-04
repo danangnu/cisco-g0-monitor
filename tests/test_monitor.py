@@ -790,14 +790,19 @@ def test_two_weeks_of_cycles_end_to_end(tmp_path):
     assert kinds.count("INTERNET_DOWN") == 4 and kinds.count("INTERNET_RESTORED") == 4   # 2 routers x 2 nights
     assert hist.conn.execute("SELECT COUNT(*) FROM configs").fetchone()[0] == 2            # one snapshot each, unchanged after
     assert hist.conn.execute("SELECT COUNT(*) FROM incidents WHERE category='internet'").fetchone()[0] == 4
-    diag_calls = [c for c in claude.calls if c["tools"][0]["name"] == "report_diagnosis"]
-    report_calls = [c for c in claude.calls if c["tools"][0]["name"] == "weekly_narrative"]
+    diag_calls = [c for c in claude.calls if c.get("tools") and c["tools"][0]["name"] == "report_diagnosis"]
+    report_calls = [c for c in claude.calls if c.get("tools") and c["tools"][0]["name"] == "weekly_narrative"]
+    audit_calls = [c for c in claude.calls if not c.get("tools")]
+    assert len(audit_calls) == 2   # first audit (new findings) + the 7-day reminder while critical/high stay open
     assert len(diag_calls) == 2 and len(report_calls) == 1
     second = json.loads(diag_calls[1]["messages"][0]["content"].split("(JSON):\n\n", 1)[1].rsplit("\n\nDiagnose", 1)[0])
     hist_ctx = second["history_last_30_days"]["rtr-143"]
     assert hist_ctx["incidents"] >= 1 and hist_ctx["incidents_by_hour_of_day"].get("2") == 1
     assert hist_ctx["config"]["last_backup"]
-    assert len(notifier.reports) == 1 and notifier.reports[0][0].startswith("Cisco WAN weekly report")
+    weekly = [r for r in notifier.reports if r[0].startswith("Cisco WAN weekly report")]
+    audits = [r for r in notifier.reports if r[0].startswith("Cisco security audit")]
+    assert len(weekly) == 1 and len(audits) == 2            # first audit + 7-day reminder
+    assert "new finding" in audits[0][0] and "/100 (" in weekly[0][2]   # security column in the weekly table
     s = hist.summary_for("rtr-143", t, 14)
     assert s["uptime_percent"] and 95 < s["uptime_percent"] < 100
 
@@ -1007,3 +1012,173 @@ def test_subjects_say_recovered():
     assert _subject(ups).startswith("[Cisco G0/0 Monitor] RECOVERED: rtr-143, rtr-145, rtr-147, rtr-149")
     mixed = ups[:2] + [ev("rtr-147"), ev("rtr-149", "FLAPPING", "warning")]
     assert "(1 critical, 1 warning, 2 recovered)" in build_report(mixed, "a@x.com")["subject"]
+
+
+# ---------------- Stage 4: security audit ----------------
+from monitor import audit as audit_mod, posture as posture_mod  # noqa: E402
+
+INSECURE_CFG = """version 15.4
+service tcp-small-servers
+hostname rtr-143
+!
+enable password 7 0822455D0A16
+username admin privilege 15 password 0 cisco123
+username ops privilege 15 secret 5 $1$abc
+!
+ip http server
+!
+interface GigabitEthernet0/0
+ ip address dhcp
+ ip nat outside
+!
+interface GigabitEthernet0/1
+ ip address 192.168.18.143 255.255.255.0
+!
+snmp-server community public RO
+snmp-server community s3cretRW RW
+!
+line con 0
+ exec-timeout 0 0
+line aux 0
+line vty 0 4
+ password 7 094F471A1A0A
+ transport input all
+!
+end
+"""
+
+HARDENED_CFG = """version 15.4
+service password-encryption
+service timestamps log datetime msec localtime show-timezone
+no service tcp-small-servers
+no service udp-small-servers
+hostname rtr-143
+!
+aaa new-model
+aaa authentication login default local
+enable algorithm-type scrypt secret 9 $9$abc
+username danang privilege 15 algorithm-type scrypt secret 9 $9$def
+!
+no ip source-route
+no ip http server
+no ip http secure-server
+ip ssh version 2
+ip ssh dh min size 2048
+login block-for 120 attempts 5 within 60
+logging host 192.168.18.22
+ntp server pool.ntp.org
+no cdp run
+banner login ^C Authorised access only ^C
+!
+ip access-list standard MGMT
+ permit 192.168.18.0 0.0.0.255
+ip access-list extended WAN-IN
+ deny tcp any any eq 22 log
+ permit ip any any
+!
+interface GigabitEthernet0/0
+ ip address dhcp
+ ip access-group WAN-IN in
+ no ip redirects
+ no ip unreachables
+ no ip proxy-arp
+ ip nat outside
+!
+line con 0
+ exec-timeout 10 0
+line aux 0
+ no exec
+ transport input none
+line vty 0 4
+ access-class MGMT in
+ exec-timeout 10 0
+ transport input ssh
+!
+end
+"""
+
+
+def test_audit_finds_the_classic_problems_and_redacts():
+    fs = audit_mod.audit_config(INSECURE_CFG, "rtr-143")
+    rules = {f.rule for f in fs}
+    assert {"enable_password", "plaintext_passwords", "type7_passwords", "snmp", "http_server", "vty_telnet",
+            "vty_no_acl", "wan_interface", "small_services", "exec_timeout", "accounts", "md5_secrets"} <= rules
+    crit = [f for f in fs if f.severity == "critical"]
+    assert {f.rule for f in crit} == {"enable_password", "plaintext_passwords", "snmp"}
+    joined = " ".join(e for f in fs for e in f.evidence) + " ".join(f.detail + f.title for f in fs)
+    assert "cisco123" not in joined and "0822455D0A16" not in joined and "s3cretRW" not in joined and "public" not in joined
+    assert "[REDACTED]" in joined
+    assert len({f.fingerprint for f in fs}) == len(fs)   # every finding tracked separately
+    assert audit_mod.score(fs) < 20
+    assert fs == sorted(fs, key=lambda f: audit_mod.SEV_ORDER[f.severity])
+    # the RW community must not also be reported as "v2c without ACL"
+    assert not any(f.title.startswith("SNMPv2c community without") and "RW" in " ".join(f.evidence) for f in fs)
+
+
+def test_audit_hardened_config_is_mostly_clean():
+    fs = audit_mod.audit_config(HARDENED_CFG, "rtr-143")
+    assert not [f for f in fs if f.severity in ("critical", "high")], [f.title for f in fs]
+    assert audit_mod.score(fs) >= 95
+    assert not any(f.rule == "vty_telnet" for f in fs)
+
+
+def test_fix_script_has_placeholders_and_no_secrets():
+    fs = audit_mod.audit_config(INSECURE_CFG, "rtr-143")
+    script = audit_mod.fix_script(fs, "rtr-143")
+    assert script.startswith("! Remediation for rtr-143") and script.endswith("write memory")
+    assert "<NEW-STRONG-SECRET>" in script and "no ip http server" in script and "transport input ssh" in script
+    assert "cisco123" not in script and "public" not in script
+
+
+class ReportCapture(ReportNotifier):
+    def channels(self):
+        return ["trackit"]
+
+
+def test_posture_lifecycle_new_open_resolved(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    n = ReportCapture()
+    r1 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {"rtr-143": INSECURE_CFG}, [Device(**{**DEV.__dict__, "name": "rtr-143"})], T0, notifier=n)
+    assert len(r1["new"]) > 10 and r1["open"] == [] and r1["resolved"] == [] and len(n.reports) == 1
+    assert n.reports[0][0].startswith("Cisco security audit:") and "critical/high" in n.reports[0][0]
+    # same config next day: nothing new -> no report, findings still open
+    r2 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {"rtr-143": INSECURE_CFG}, [Device(**{**DEV.__dict__, "name": "rtr-143"})], T0 + timedelta(days=1), notifier=n)
+    assert r2["new"] == [] and len(r2["open"]) == len(r1["new"]) and len(n.reports) == 1
+    # hardened: everything resolves -> report with resolved list
+    r3 = posture_mod.run_audit(h, DEFAULT_SETTINGS, {"rtr-143": HARDENED_CFG}, [Device(**{**DEV.__dict__, "name": "rtr-143"})], T0 + timedelta(days=2), notifier=n)
+    assert len(r3["resolved"]) >= 10 and len(n.reports) == 2 and "resolved" in n.reports[1][0]
+    assert all(r["severity"] == "low" for r in posture_mod.open_findings(h, "rtr-143"))
+    p = posture_mod.summary(h, "rtr-143")
+    assert p["score"] >= 95 and p["open"]["critical"] == 0
+    assert h.summary_for("rtr-143", T0 + timedelta(days=2), 30)["security_posture"]["score"] == p["score"]
+
+
+def test_posture_report_includes_ai_note_and_renders(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    n = ReportCapture()
+    claude = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="Fix the SNMP write community and Telnet first; the rest can wait.")])))
+    posture_mod.run_audit(h, AI_SETTINGS, {"rtr-143": INSECURE_CFG}, [DEV], T0, notifier=n, client=claude)
+    subject, body, text = n.reports[0]
+    assert "Fix the SNMP write community" in body and "Fix the SNMP write community" in text
+    assert "no ip http server" in body and "[REDACTED]" in body and "cisco123" not in body
+
+
+def test_audit_runs_with_daily_backup_and_skips_quiet_days(tmp_path):
+    hist = History(str(tmp_path / "history.db"))
+    n = ReportCapture()
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
+    raw: dict = {}
+    evs = backup_mod.run([DEV], settings, hist, T0, connect=lambda d, t: FakeCfgConn(INSECURE_CFG), force=True, raw_out=raw)
+    assert DEV.name in raw and "cisco123" in raw[DEV.name]          # raw is handed to the audit only, in memory
+    stored = hist.latest_config(DEV.name)["config"]
+    assert "cisco123" not in stored and "password 0 [REDACTED]" in stored   # what is stored keeps the type, not the value
+    res = posture_mod.run_audit(hist, settings, raw, [DEV], T0, notifier=n)
+    assert res["score"][DEV.name] < 50 and len(n.reports) == 1
+
+
+def test_fix_script_warns_about_monitor_account():
+    fs = audit_mod.audit_config(INSECURE_CFG, "rtr-143", monitor_user="admin")
+    acct = next(f for f in fs if f.rule == "accounts" and "admin" in f.title)
+    assert any("THIS MONITOR" in x for x in acct.fix) and acct.fix[-2] == "no username admin"
+    assert "the monitor's own login" in acct.detail
