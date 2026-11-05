@@ -1252,3 +1252,19 @@ def test_acceptance_survives_evidence_change(tmp_path):
     assert not any("admin" in f.title for f in r["new"] + r["open"])
     assert any("admin" in f.title for f in r["accepted"])
     assert any("MD5" in f.title for f in r["resolved"])      # the real change is still reported
+
+
+def test_ppp_credentials_get_specific_advice():
+    cfg = HARDENED_CFG.replace("interface GigabitEthernet0/0\n", "interface Dialer1\n ppp chap hostname isp-user\n"
+                               " ppp chap password 0 Sup3rS3cret\n ppp pap sent-username dnurdiansyah password 0 Sup3rS3cret\n!\n"
+                               "interface GigabitEthernet0/0\n")
+    fs = audit_mod.audit_config(cfg, "rtr-231")
+    ppp = [f for f in fs if f.rule == "ppp_cleartext"]
+    assert len(ppp) == 1 and ppp[0].severity == "high" and len(ppp[0].evidence) == 2
+    assert "service password-encryption" in ppp[0].fix and "CHAP" in ppp[0].detail
+    assert not any(f.rule == "plaintext_passwords" for f in fs)           # no misleading "use secret" advice
+    assert all("Sup3rS3cret" not in e for f in fs for e in f.evidence)
+    enc = cfg.replace("password 0 Sup3rS3cret", "password 7 0822455D0A16")
+    fs7 = audit_mod.audit_config(enc, "rtr-231")
+    assert [f.severity for f in fs7 if f.rule == "ppp_credentials"] == ["low"]
+    assert not any(f.rule in ("ppp_cleartext", "type7_passwords") for f in fs7)

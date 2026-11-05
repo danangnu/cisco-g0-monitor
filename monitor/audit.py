@@ -105,36 +105,72 @@ def r_enable_password(c: Config, ctx: dict):
                ["enable algorithm-type scrypt secret <NEW-STRONG-SECRET>", "no enable password", "write memory"], ev)]
 
 
+_PPP_RE = re.compile(r"^\s*ppp\s+(chap|pap)\b", re.I)
+
+
+def _is_ppp(ln: str) -> bool:
+    return bool(_PPP_RE.match(ln))
+
+
 @rule("type7_passwords")
 def r_type7(c: Config, ctx: dict):
-    ev = [ln for ln in c.lines if re.search(r"\b(password|key|key-string)\s+7\s+\S+", ln) and not ln.lstrip().startswith("enable password")]
-    if not ev:
-        return []
-    return [_f("type7_passwords", "high", f"{len(ev)} type-7 (reversible) password(s)/key(s)",
-               "Type 7 is obfuscation, not encryption - the original value is recovered instantly. Replace with `secret` "
-               "(type 8/9) where IOS supports it, or rotate the key if the protocol only supports type 7 (keep it off shared docs).",
-               ["! user accounts:", "username <NAME> privilege 15 algorithm-type scrypt secret <NEW-STRONG-SECRET>",
-                "! for each username that only has 'password 7': add the secret, then", "no username <NAME> password",
-                "write memory"], ev)]
+    hits = [ln for ln in c.lines if re.search(r"\b(password|key|key-string)\s+7\s+\S+", ln) and not ln.lstrip().startswith("enable password")]
+    ev = [ln for ln in hits if not _is_ppp(ln)]
+    ppp = [ln for ln in hits if _is_ppp(ln)]
+    out = []
+    if ev:
+        out.append(_f("type7_passwords", "high", f"{len(ev)} type-7 (reversible) password(s)/key(s)",
+                      "Type 7 is obfuscation, not encryption - the original value is recovered instantly. Replace with `secret` "
+                      "(type 8/9) where IOS supports it, or rotate the key if the protocol only supports type 7 (keep it off shared docs).",
+                      ["! user accounts:", "username <NAME> privilege 15 algorithm-type scrypt secret <NEW-STRONG-SECRET>",
+                       "! for each username that only has 'password 7': add the secret, then", "no username <NAME> password",
+                       "write memory"], ev))
+    if ppp:
+        out.append(_f("ppp_credentials", "low", f"{len(ppp)} PPP CHAP/PAP credential(s) stored as type 7",
+                      "PPP CHAP/PAP must store the ISP password reversibly (the router sends it to the ISP), so type 7 is the "
+                      "best IOS can do - this is expected. Keep config backups and 'show run' output private, and rotate the "
+                      "ISP password if a config was ever shared. Accept this finding once reviewed.",
+                      ["! nothing to change on the router; review and then:",
+                       "! docker compose run --rm cisco-g0-monitor --accept <router> \"PPP CHAP/PAP credential\" --reason \"required by ISP link\""],
+                      ppp))
+    return out
 
 
 @rule("plaintext_passwords")
 def r_plaintext(c: Config, ctx: dict):
-    ev = [ln for ln in c.lines if re.search(r"\b(password|key)\s+0\s+\S+", ln)
-          or re.search(r"^username\s+\S+(\s+privilege\s+\d+)?\s+password\s+(?!\d\s)\S+", ln.strip())
-          or re.search(r"^\s*password\s+(?![05789]\s)\S+$", ln)]
-    if not ev:
-        return []
-    weak = []
-    for ln in ev:
-        m = re.search(r"(?:password|key)\s+(?:0\s+)?(\S+)\s*$", ln.strip())
-        if m and (len(m.group(1)) < 8 or m.group(1).lower() in WEAK_WORDS):
-            weak.append(ln)
-    detail = ("Passwords stored in cleartext. Anyone with read access to the config has them."
-              + (f" {len(weak)} of them are also short or a common word." if weak else ""))
-    return [_f("plaintext_passwords", "critical", f"{len(ev)} cleartext password(s)", detail,
-               ["service password-encryption", "username <NAME> privilege 15 algorithm-type scrypt secret <NEW-STRONG-SECRET>",
-                "no username <NAME> password", "line vty 0 4", " login local", "write memory"], ev)]
+    hits = [ln for ln in c.lines if re.search(r"\b(password|key)\s+0\s+\S+", ln)
+            or re.search(r"^username\s+\S+(\s+privilege\s+\d+)?\s+password\s+(?!\d\s)\S+", ln.strip())
+            or re.search(r"^\s*password\s+(?![05789]\s)\S+$", ln)
+            or (_is_ppp(ln) and re.search(r"\bpassword\s+(?![57]\s)\S+", ln))]
+    ev = [ln for ln in hits if not _is_ppp(ln)]
+    ppp = [ln for ln in hits if _is_ppp(ln)]
+    out = []
+    if ev:
+        weak = []
+        for ln in ev:
+            m = re.search(r"(?:password|key)\s+(?:0\s+)?(\S+)\s*$", ln.strip())
+            if m and (len(m.group(1)) < 8 or m.group(1).lower() in WEAK_WORDS):
+                weak.append(ln)
+        detail = ("Passwords stored in cleartext. Anyone with read access to the config has them."
+                  + (f" {len(weak)} of them are also short or a common word." if weak else ""))
+        out.append(_f("plaintext_passwords", "critical", f"{len(ev)} cleartext password(s)", detail,
+                      ["service password-encryption", "username <NAME> privilege 15 algorithm-type scrypt secret <NEW-STRONG-SECRET>",
+                       "no username <NAME> password", "line vty 0 4", " login local", "write memory"], ev))
+    if ppp:
+        pap = any(re.search(r"\bppp\s+pap\b", ln, re.I) for ln in ppp)
+        out.append(_f("ppp_cleartext", "high", f"{len(ppp)} PPP CHAP/PAP password(s) in cleartext",
+                      "The router's ISP/link password is readable by anyone who sees the config. PPP needs a reversible password, "
+                      "so it cannot be hashed - but `service password-encryption` turns it into type 7, which keeps it out of "
+                      "casual view (screens, tickets, backups)."
+                      + (" PAP also sends the password unencrypted to the other end; if the ISP supports CHAP, use CHAP only." if pap else ""),
+                      ["service password-encryption",
+                       "! if the ISP supports CHAP, on the Dialer/PPP interface:",
+                       "!   ppp authentication chap callin",
+                       "!   no ppp pap sent-username",
+                       "write memory",
+                       "! if this config was ever emailed or shared, ask the ISP to change the password"],
+                      ppp))
+    return out
 
 
 @rule("md5_secrets")

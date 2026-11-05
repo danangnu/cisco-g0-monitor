@@ -1,14 +1,7 @@
-feat: daily security audit of router configs (agent stage 4)
+fix: correct audit advice for PPP CHAP/PAP credentials
 
-- Add ~25 IOS hardening rules: credentials, management plane, SNMP, legacy services, WAN interface, operations
-- Score each router's posture and track findings as new / open / resolved in history.db
-- Email an audit report with redacted evidence and fix commands only when something changes
-- Add a Claude priority note to the report and posture context to outage diagnoses
-- Show security posture in the weekly report
-- Keep password type digits through redaction so diffs and audits stay meaningful
-- Base SSH findings on `show ip ssh` instead of config defaults; report SHA-1-only key exchange
-- Drop the exec-timeout false positive (IOS hides the 10-minute default)
-- Warn in the fix script when a flagged account is the monitor's own login
-- Add --accept/--unaccept for known limitations, carried over when evidence changes
-- Add --audit, --audit-fix and --config-diff commands
-- Release version 1.4.1
+- Report cleartext PPP CHAP/PAP passwords as their own HIGH finding
+- Recommend service password-encryption and CHAP-only instead of "use secret"
+- Report type-7 PPP credentials as an expected LOW finding to review and accept
+- Keep PPP lines out of the generic cleartext and type-7 password findings
+- Release version 1.4.2
