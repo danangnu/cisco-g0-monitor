@@ -73,6 +73,18 @@ audit:
   remind_days: 7                   # re-send while critical/high findings stay open
   use_ai: true                     # one Claude call per report for a plain-language priority note
 
+# Stage 5: traffic visibility from the routers' own NetFlow cache, read over the existing SSH session
+# (nothing is exported, no inbound port). Turn on AFTER applying `--netflow-config <router>` on a router;
+# routers without the flow monitor are skipped. Metadata only: addresses, port, bytes - never contents.
+flows:
+  enabled: false
+  monitor_name: G0MON              # name of the flow monitor on the routers
+  detail_min_mb: 1                 # keep the destination for host->destination flows above this per 5 minutes
+  retention_days: 14               # hourly traffic rollups older than this are pruned
+  lookback_days: 7                 # a traffic finding stays open while seen within this window
+  upload_gb_alert: 5               # one host sending more than this to one internet address in a day
+  scan_min_destinations: 100       # one host touching this many addresses on one port within 5 minutes
+
 notify:
   # Same as the Teltonika SMS Console: alerts are queued in TrackIT `logbulkmail`
   # (mailstatus 'Queue in Database') and TrackIT's mailer sends them.

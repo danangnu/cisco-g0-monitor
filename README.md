@@ -1,6 +1,6 @@
 # cisco-g0-monitor
 
-Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, proposes fixes you approve with one command, audits router security daily, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
+Watches every Cisco IOS / IOS-XE router in your inventory, diagnoses faults with Claude, proposes fixes you approve with one command, audits router security daily, watches what the sites send with NetFlow, and alerts by **email (queued through TrackIT `logbulkmail`, the same way the Teltonika SMS Console sends its alerts)** and optionally **Microsoft Teams / Slack** when:
 
 | Event | Severity | When |
 |---|---|---|
@@ -212,6 +212,66 @@ session open while changing vty/ACL/SSH settings, and apply it in a maintenance 
 The raw config is only ever held in memory for the audit; what is stored (`history.db`) and emailed is
 redacted. Nothing in the audit changes router configuration.
 
+## Traffic visibility from NetFlow (Stage 5 of the agent)
+
+Each router can keep a small Flexible NetFlow cache of what the hosts behind it send: source,
+destination, protocol, destination port, bytes. **Nothing is exported** - the monitor reads the cache
+over the SSH session it already uses (`show flow monitor G0MON cache format csv`, read-only), so
+there is no collector port, no firewall rule and no new traffic path. It is metadata only: who talked
+to whom on which port and how much, never the contents.
+
+Set-up, per router:
+
+```bash
+docker compose run --rm cisco-g0-monitor --netflow-config rtr-143   # prints the commands for that router
+```
+
+It reads the last config backup to find the LAN-side interface(s) (`ip nat inside`) and prints the
+`flow record` / `flow monitor` / `ip flow monitor G0MON input` lines plus how to verify and how to
+remove it. **Check the interface it picked**, paste the block on the router, then:
+
+```bash
+docker compose run --rm cisco-g0-monitor --flows-check rtr-143      # one read: raw output + what was parsed
+```
+
+When that shows flow entries, set `flows.enabled: true` in `settings.yaml` and restart. Routers that do
+not have the monitor yet are detected and skipped (re-checked hourly), so you can roll out one at a time.
+
+What you get:
+
+| Finding | Severity | Meaning |
+|---|---|---|
+| Telnet / FTP / POP3-IMAP without TLS / rlogin-rsh in use | high | Cleartext logins on the wire, with the hosts, destinations and usual time of day |
+| TFTP in use | medium | Unauthenticated transfers |
+| SMB/NetBIOS, RDP or SNMP to the internet | high | Internal-only services leaving the site |
+| Database protocol or LDAP to the internet | medium | Usually unencrypted logins |
+| SMTP (port 25) to the internet | low | Fine for a mail server or scanner; a spam-bot pattern from a PC |
+| Large upload from one host to one internet address | medium | More than `upload_gb_alert` GB in a day |
+| Possible scan / ping sweep | high or medium | One host touching `scan_min_destinations`+ addresses on one port in 5 minutes |
+
+Traffic findings join the security audit: same daily email (only when something is new or resolved),
+same `--accept` / `--unaccept`, same score, and a "Sent (24h)" column in the weekly report. Claude also
+gets each router's 24-hour traffic summary when diagnosing an outage.
+
+```bash
+docker compose run --rm cisco-g0-monitor --flows all       # top hosts, services, destinations, open traffic findings
+```
+
+Things to know:
+
+- **Flows cannot show a password.** They show that a cleartext protocol is in use, by which host, to where
+  and when - which is what you need to go and fix it.
+- The first read after start-up, and the first after the monitor has been off for more than ~10 minutes,
+  is a baseline only (nothing is counted), so downtime never shows up as a traffic spike.
+- Only traffic that **enters the router from its LAN side** is seen. Host-to-host traffic inside one LAN
+  does not pass the router and is not visible.
+- Hourly rollups are kept for `retention_days` (14). Destinations are stored only for watched ports and
+  for flows above `detail_min_mb`; everything else is kept as per-host, per-port totals.
+- This looks at staff traffic metadata: cover it in your IT acceptable-use policy.
+- Router load: ingress NetFlow with a 32k-entry cache is light on an ISR, but check
+  `show processes cpu history` after enabling it. If the log says "CACHE NEARLY FULL", raise
+  `flows.cache_entries` and re-apply the config.
+
 ## How email is sent (TrackIT, same as Teltonika)
 
 The monitor does not talk to a mail server. Like `trackitDeviceFaultAlert.ts` in the Teltonika SMS Console, it inserts one row per recipient into TrackIT's `logbulkmail` table and TrackIT's mailer sends it:
@@ -305,8 +365,9 @@ monitor/
   actions.py     Stage 3: fix catalogue, proposals, approved execution with verification
   audit.py       Stage 4: IOS config security rules, scoring, remediation script
   posture.py     Stage 4: finding lifecycle (new/open/resolved), audit report
+  flows.py       Stage 5: NetFlow cache polling over SSH, hourly rollups, traffic findings
   state.py       state.json, events.jsonl, heartbeat
-  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report, --proposals, --approve, --reject, --audit, --audit-fix)
+  main.py        loop + CLI (--once, --check, --status, --test-alert, --diagnose, --history, --backup, --report, --proposals, --approve, --reject, --audit, --audit-fix, --netflow-config, --flows-check, --flows)
   healthcheck.py Docker HEALTHCHECK
 tests/           pytest suite with simulated IOS / IOS-XE output
 ```

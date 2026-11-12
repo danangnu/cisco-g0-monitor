@@ -43,6 +43,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "report": {"enabled": True, "weekday": 0, "hour": 8, "days": 7, "use_ai": True},
     "actions": {"enabled": True, "expire_hours": 4, "cooldown_hours": 6, "max_per_day": 4},
     "audit": {"enabled": True, "notify_min_severity": "medium", "use_ai": True, "remind_days": 7},
+    "flows": {"enabled": False, "monitor_name": "G0MON", "cache_entries": 32768, "detail_min_mb": 1, "retention_days": 14,
+              "lookback_days": 7, "upload_gb_alert": 5, "scan_min_destinations": 100, "cache_warn_percent": 85},
     "notify": {
         "trackit": {"enabled": False, "db_host": "", "db_port": 3306, "db_user": "", "db_password": "",
                     "db_name": "trackitlive", "to": [], "from": "", "from_name": "Cisco G0/0 Monitor",
@@ -65,6 +67,8 @@ DEVICE_DEFAULTS: dict[str, Any] = {
     "ping_targets": ["8.8.8.8", "1.1.1.1"],
     "expected_subnet": None,
     "enabled": True,
+    "flows": True,              # read this router's NetFlow cache when flows.enabled is on
+    "lan_interfaces": [],       # override the LAN interfaces --netflow-config would pick
 }
 
 SUPPORTED_TYPES = {"cisco_ios", "cisco_xe"}
@@ -106,6 +110,8 @@ class Device:
     ping_targets: list[str] = field(default_factory=list)
     expected_subnet: Optional[str] = None
     enabled: bool = True
+    flows: bool = True
+    lan_interfaces: list[str] = field(default_factory=list)
 
 
 def load_settings(path: str) -> dict:
@@ -142,6 +148,9 @@ def load_devices(path: str) -> list[Device]:
             d["ping_targets"] = [t.strip() for t in d["ping_targets"].split(",") if t.strip()]
         d["port"] = int(d["port"])
         d["vrf"] = d.get("vrf") or None
+        lan = d.get("lan_interfaces") or []
+        d["lan_interfaces"] = [x.strip() for x in lan.split(",") if x.strip()] if isinstance(lan, str) else list(lan)
+        d["flows"] = bool(d.get("flows", True))
         devices.append(Device(**{k: d[k] for k in Device.__dataclass_fields__}))
     if not devices:
         raise ValueError("No devices defined in devices file")

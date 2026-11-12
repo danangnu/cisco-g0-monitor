@@ -32,7 +32,9 @@ MIGRATIONS = ["ALTER TABLE audit_findings ADD COLUMN accepted_at TEXT",
 
 AI_SYSTEM = """You are a network security engineer writing a short note for an IT manager about the security
 posture of a few Cisco routers. You get the audit findings (rule, severity, title, evidence, fix commands)
-split into NEW, STILL OPEN and RESOLVED. Write 3-6 sentences max: what matters most and why, in plain
+split into NEW, STILL OPEN and RESOLVED. Rules starting with "flow_" come from the routers' traffic (NetFlow)
+metadata - who talked to whom on which port - and are fixed on the hosts named in the evidence, not on the
+router; the others come from the router configuration. Write 3-6 sentences max: what matters most and why, in plain
 language, what to fix first and what can wait. No generic advice, no repetition of the table. Mention
 anything that interacts (e.g. Telnet + reversible passwords = credentials readable on the wire AND in
 backups). If everything is low severity, say the routers are in reasonable shape."""
@@ -78,29 +80,50 @@ def unaccept(hist: History, device: Optional[str], title_part: str) -> int:
         return hist.conn.execute(q, args).rowcount
 
 
+def _scope(rule: str) -> str:
+    return "flow" if rule.startswith("flow_") else "config"
+
+
 def run_audit(hist: History, settings: dict, raw_configs: dict, devices: list, now: datetime, notifier=None,
-              client=None, force_report: bool = False, facts: Optional[dict] = None) -> dict:
-    """raw_configs: {device_name: raw running-config text}. Returns {"new":[], "open":[], "resolved":[], "score":{}}."""
+              client=None, force_report: bool = False, facts: Optional[dict] = None,
+              extra: Optional[dict] = None) -> dict:
+    """Audit configs and track every finding's lifecycle.
+
+    raw_configs: {device: raw running-config text}  -> config findings ("config" scope)
+    extra:       {device: [Finding, ...]}            -> traffic findings from flows.analyse ("flow" scope)
+    A scope only resolves its own findings: a config audit never closes a traffic finding and vice versa.
+    Returns {"new": [], "open": [], "resolved": [], "accepted": [], "score": {}, "findings": {}}.
+    """
     cfg = _cfg(settings)
     ensure_schema(hist)
     ts = now.isoformat(timespec="seconds")
     by_dev = {d.name: d for d in devices}
+    extra = extra or {}
     new, still_open, resolved, accepted, scores, all_now = [], [], [], [], {}, {}
-    for name, raw in raw_configs.items():
+    names = list(raw_configs) + [n for n in extra if n not in raw_configs]
+    for name in names:
         dv = by_dev.get(name)
-        findings = audit_config(raw, name, [dv.interface] if dv else ["GigabitEthernet0/0"],
-                                monitor_user=dv.username if dv else "", facts=(facts or {}).get(name))
+        findings: list[Finding] = []
+        scopes = set()
+        if name in raw_configs:
+            scopes.add("config")
+            findings += audit_config(raw_configs[name], name, [dv.interface] if dv else ["GigabitEthernet0/0"],
+                                     monitor_user=dv.username if dv else "", facts=(facts or {}).get(name))
+        if name in extra:
+            scopes.add("flow")
+            for f in extra[name]:
+                f.device = name
+            findings += extra[name]
         all_now[name] = findings
-        acc_fps = {r["fingerprint"] for r in hist.conn.execute(
-            "SELECT fingerprint FROM audit_findings WHERE device=? AND accepted_at IS NOT NULL", (name,))}
-        scores[name] = score([f for f in findings if f.fingerprint not in acc_fps])
         seen = {f.fingerprint for f in findings}
         with hist.conn:
             for f in findings:
                 row = hist.conn.execute("SELECT first_seen, resolved_at, accepted_at FROM audit_findings WHERE fingerprint=?",
                                         (f.fingerprint,)).fetchone()
                 if row and not row["resolved_at"]:
-                    hist.conn.execute("UPDATE audit_findings SET last_seen=? WHERE fingerprint=?", (ts, f.fingerprint))
+                    hist.conn.execute("UPDATE audit_findings SET last_seen=?, severity=?, title=?, detail=?, evidence=?, fix=? "
+                                      "WHERE fingerprint=?", (ts, f.severity, f.title, f.detail, json.dumps(f.evidence),
+                                                              json.dumps(f.fix), f.fingerprint))
                     if row["accepted_at"]:
                         accepted.append(f)
                     else:
@@ -114,24 +137,29 @@ def run_audit(hist: History, settings: dict, raw_configs: dict, devices: list, n
                     hist.conn.execute("INSERT INTO audit_findings (fingerprint,device,rule,severity,title,detail,evidence,fix,"
                                       "first_seen,last_seen,resolved_at,accepted_at,accepted_reason) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?) "
                                       "ON CONFLICT(fingerprint) DO UPDATE SET first_seen=excluded.first_seen, last_seen=excluded.last_seen, "
-                                      "resolved_at=NULL, accepted_at=excluded.accepted_at, accepted_reason=excluded.accepted_reason",
+                                      "severity=excluded.severity, title=excluded.title, detail=excluded.detail, evidence=excluded.evidence, "
+                                      "fix=excluded.fix, resolved_at=NULL, accepted_at=excluded.accepted_at, accepted_reason=excluded.accepted_reason",
                                       (f.fingerprint, name, f.rule, f.severity, f.title, f.detail, json.dumps(f.evidence),
                                        json.dumps(f.fix), ts, ts, prior["accepted_at"] if prior else None,
                                        prior["accepted_reason"] if prior else None))
                     (accepted if prior else new).append(f)
             for r in hist.conn.execute("SELECT * FROM audit_findings WHERE device=? AND resolved_at IS NULL", (name,)).fetchall():
-                if r["fingerprint"] not in seen:
+                if r["fingerprint"] not in seen and _scope(r["rule"]) in scopes:
                     hist.conn.execute("UPDATE audit_findings SET resolved_at=? WHERE fingerprint=?", (ts, r["fingerprint"]))
                     resolved.append(Finding(r["rule"], r["severity"], r["title"], r["detail"], json.loads(r["fix"] or "[]"),
                                             json.loads(r["evidence"] or "[]"), r["device"]))
+        # score = everything still open and not accepted for this router (config + traffic)
+        weights = {"critical": 25, "high": 10, "medium": 4, "low": 1}
+        scores[name] = max(0, 100 - sum(weights.get(r["severity"], 0) for r in hist.conn.execute(
+            "SELECT severity FROM audit_findings WHERE device=? AND resolved_at IS NULL AND accepted_at IS NULL", (name,))))
     hist.set_meta("audit:last_run", ts)
-    for name in raw_configs:
+    for name in names:
         log.info("Security audit %s: score %d/100, %d finding(s), %d new, %d resolved", name, scores[name],
                  len(all_now[name]), sum(f.device == name for f in new), sum(f.device == name for f in resolved))
 
     # record a timeline event per router with new/resolved counts (not emailed; the report below is)
     events = []
-    for name in raw_configs:
+    for name in names:
         n_new = [f for f in new if f.device == name]
         n_res = [f for f in resolved if f.device == name]
         if n_new or n_res:

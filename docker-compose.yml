@@ -1,7 +1,7 @@
 services:
   cisco-g0-monitor:
     build: .
-    image: cisco-g0-monitor:1.4.0
+    image: cisco-g0-monitor:1.5.1
     container_name: cisco-g0-monitor
     restart: unless-stopped
     env_file: .env

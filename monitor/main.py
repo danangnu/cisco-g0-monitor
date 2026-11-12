@@ -13,6 +13,9 @@ Usage:
   python -m monitor.main --audit all     # security audit of running-configs, emails the report
   python -m monitor.main --audit-fix rtr-143   # remediation script for one router
   python -m monitor.main --accept all "SHA-1 methods only" --reason "1921 IOS limitation"
+  python -m monitor.main --netflow-config rtr-143   # NetFlow commands for a router
+  python -m monitor.main --flows-check rtr-143      # read its flow cache once
+  python -m monitor.main --flows all                # traffic summary, last 24h
   python -m monitor.main --proposals     # list proposed fixes
   python -m monitor.main --approve A7K3  # run a proposed fix after re-checking the fault
   python -m monitor.main --reject A7K3
@@ -30,7 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
-from . import actions, backup, posture, report, trends
+from . import actions, backup, flows, posture, report, trends
 from .collector import _default_connect, check_device
 from .diagnose import diagnose_cycle
 from .history import History
@@ -86,10 +89,19 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
             all_events += backup.run(active, settings, hist, now, connect=connect, raw_out=raw_configs, facts_out=facts)
         except Exception:  # noqa: BLE001
             log.exception("Config backup failed")
-        # Stage 4: security audit of today's configs (report only when something changed)
-        if raw_configs and settings.get("audit", {}).get("enabled", True):
+        # Stage 5: yesterday's traffic turned into findings (same report as the config audit)
+        traffic: dict = {}
+        if settings.get("flows", {}).get("enabled"):
             try:
-                posture.run_audit(hist, settings, raw_configs, active, now, notifier=notifier, client=ai_client, facts=facts)
+                traffic = flows.analyse(hist, active, now, settings)
+                flows.prune(hist, now, settings)
+            except Exception:  # noqa: BLE001
+                log.exception("Traffic analysis failed")
+        # Stage 4: security audit of today's configs (report only when something changed)
+        if (raw_configs or traffic) and settings.get("audit", {}).get("enabled", True):
+            try:
+                posture.run_audit(hist, settings, raw_configs, active, now, notifier=notifier, client=ai_client,
+                                  facts=facts, extra=traffic)
             except Exception:  # noqa: BLE001
                 log.exception("Security audit failed")
         raw_configs.clear()
@@ -114,6 +126,13 @@ def run_cycle(devices, settings, store: StateStore, notifier: Notifier, connect=
     except Exception:  # noqa: BLE001
         log.exception("Could not write history")
     notifier.send(all_events, diagnosis)
+
+    # Stage 5: read each router's NetFlow cache (after alerts are out, so it never delays them)
+    if settings.get("flows", {}).get("enabled"):
+        try:
+            flows.poll_all([d for d in active if d.flows and results[d.name].reachable], settings, hist, now, connect=connect)
+        except Exception:  # noqa: BLE001
+            log.exception("Flow collection failed")
 
     # Stage 2: weekly report
     if report.is_due(hist, settings, now):
@@ -288,7 +307,8 @@ def cmd_audit(args, devices, settings, store: StateStore, notifier: Notifier) ->
         print(f"Could not fetch: {', '.join(missing)}")
     if not raw:
         return 1
-    res = posture.run_audit(hist, settings, raw, chosen, now, notifier=notifier, force_report=True, facts=facts)
+    traffic = flows.analyse(hist, chosen, now, settings) if settings.get("flows", {}).get("enabled") else {}
+    res = posture.run_audit(hist, settings, raw, chosen, now, notifier=notifier, force_report=True, facts=facts, extra=traffic)
     raw.clear()
     for name, fs in res["findings"].items():
         print(f"\n=== {name}: score {res['score'][name]}/100, {len(fs)} finding(s) ===")
@@ -302,6 +322,85 @@ def cmd_audit(args, devices, settings, store: StateStore, notifier: Notifier) ->
     print(f"\nReport sent via: {', '.join(notifier.channels()) or 'nothing (no channels enabled)'}. "
           f"Use --audit-fix <router> for a remediation script.")
     return 0
+
+
+def cmd_flows(args, devices, settings, store: StateStore) -> int:
+    hist = History(os.path.join(store.dir, "history.db"))
+    now = datetime.now().astimezone()
+    by_name = {d.name: d for d in devices}
+
+    def pick(target: str):
+        chosen = [d for d in devices if d.enabled] if target == "all" else [by_name[n] for n in target.split(",") if n in by_name]
+        if not chosen:
+            print(f"Unknown device(s) {target!r}. Known: {', '.join(by_name)}")
+        return chosen
+
+    if args.netflow_config:
+        chosen = pick(args.netflow_config)
+        for dv in chosen:
+            lan, how = list(dv.lan_interfaces), "lan_interfaces set in devices.yaml"
+            if not lan:
+                snap = hist.latest_config(dv.name)
+                if not snap:
+                    print(f"! {dv.name}: no config backup yet - run --backup first (or set lan_interfaces in devices.yaml)\n")
+                    continue
+                lan, how = flows.lan_interfaces_from_config(snap["config"], dv.interface)
+            if not lan:
+                print(f"! {dv.name}: could not work out the LAN interface - set lan_interfaces: [...] for it in devices.yaml\n")
+                continue
+            print(f"! LAN interface(s) for {dv.name}: {', '.join(lan)}  ({how}) - CHECK THIS before applying")
+            print(flows.router_config(dv, lan, settings))
+            print()
+        return 0 if chosen else 1
+
+    if args.flows_check:
+        dv = by_name.get(args.flows_check)
+        if not dv:
+            print(f"Unknown device {args.flows_check!r}. Known: {', '.join(by_name)}")
+            return 1
+        name = settings.get("flows", {}).get("monitor_name", "G0MON")
+        print(f"Reading the flow cache on {dv.name} (show flow monitor {name} cache format csv)...")
+        try:
+            raw = flows.fetch_cache(dv, settings)
+        except Exception as e:  # noqa: BLE001
+            print(f"SSH failed: {type(e).__name__}: {e}")
+            return 2
+        lines = raw.splitlines()
+        print(f"--- raw output: {len(lines)} lines, first 25 ---")
+        print("\n".join(lines[:25]))
+        print("--- parsed ---")
+        try:
+            meta, rows = flows.parse_cache_csv(raw)
+        except flows.FlowNotConfigured as e:
+            print(f"No usable flow monitor: {e}")
+            print(f"On the router, check:  show running-config | section flow   and   show flow monitor")
+            print(f"Commands to add it:    --netflow-config {dv.name}")
+            return 2
+        print(f"cache: {meta}")
+        print(f"{len(rows)} flow entries parsed")
+        for r in sorted(rows, key=lambda r: -r.bytes)[:10]:
+            print(f"  {r.src:15} -> {r.dst:15} {flows.svc_name(r.proto, r.dport):22} {flows.fmt_bytes(r.bytes):>10} {r.pkts:>8} pkts")
+        return 0
+
+    chosen = pick(args.flows)
+    for dv in chosen:
+        t = flows.traffic_summary(hist, dv.name, now, 24)
+        if not t:
+            print(f"=== {dv.name}: no flow data yet (is flows.enabled on, and the monitor configured? --netflow-config {dv.name}) ===\n")
+            continue
+        print(f"=== {dv.name} - last 24h: {t['sent']} sent by {t['hosts']} host(s); cache {t['cache']}; last read {str(t['last_poll'])[:16]} ===")
+        if t["peak_hour"]:
+            print(f"  busiest hour: {t['peak_hour']['hour']} ({t['peak_hour']['sent']})")
+        print("  top hosts:        " + ", ".join(f"{h['host']} {h['sent']}" for h in t["top_hosts"]))
+        print("  top services:     " + ", ".join(f"{x['service']} {x['sent']} ({x['hosts']} hosts)" for x in t["top_services"]))
+        print("  top destinations: " + ", ".join(f"{x['dst']} {x['sent']}" for x in t["top_destinations"]))
+        for f in posture.open_findings(hist, dv.name):
+            if f["rule"].startswith("flow_"):
+                print(f"  [{f['severity'].upper():8}] {f['title']}")
+                for e in f["evidence"][:3]:
+                    print(f"             {e}")
+        print()
+    return 0 if chosen else 1
 
 
 def cmd_history(target: str, devices, store: StateStore, days: int = 30) -> int:
@@ -363,6 +462,9 @@ def main(argv=None) -> int:
     g.add_argument("--accept", nargs=2, metavar=("DEVICE|all", "TITLE-TEXT"), help="accept open findings whose title contains TITLE-TEXT (known limitation); use with --reason")
     g.add_argument("--unaccept", nargs=2, metavar=("DEVICE|all", "TITLE-TEXT"), help="undo --accept")
     p.add_argument("--reason", default="", help="why a finding is accepted (with --accept)")
+    g.add_argument("--netflow-config", metavar="DEVICE|all", help="print the NetFlow commands to apply on a router")
+    g.add_argument("--flows-check", metavar="DEVICE", help="read a router's flow cache once and show what was parsed")
+    g.add_argument("--flows", metavar="DEVICE|all", help="traffic summary for the last 24h from collected flows")
     g.add_argument("--approve", metavar="ID", help="approve and run a proposed fix (ID from the alert email)")
     g.add_argument("--reject", metavar="ID", help="reject a proposed fix")
     g.add_argument("--proposals", action="store_true", help="list recent proposed fixes and their status")
@@ -414,6 +516,8 @@ def main(argv=None) -> int:
         return 0
     if args.approve or args.reject or args.proposals:
         return cmd_actions(args, devices, settings, store, notifier)
+    if args.netflow_config or args.flows_check or args.flows:
+        return cmd_flows(args, devices, settings, store)
     if args.audit or args.audit_fix or args.config_diff or args.accept or args.unaccept:
         return cmd_audit(args, devices, settings, store, notifier)
     if args.report:

@@ -31,10 +31,12 @@ class Finding:
     fix: list[str]
     evidence: list[str] = field(default_factory=list)   # redacted config lines
     device: str = ""
+    key: str = ""        # stable identity for findings whose evidence changes over time (traffic findings)
 
     @property
     def fingerprint(self) -> str:
-        return hashlib.sha256(f"{self.device}|{self.rule}|{self.title}|{'|'.join(sorted(self.evidence))}".encode()).hexdigest()[:16]
+        ident = self.key if self.key else f"{self.title}|{'|'.join(sorted(self.evidence))}"
+        return hashlib.sha256(f"{self.device}|{self.rule}|{ident}".encode()).hexdigest()[:16]
 
     def to_dict(self) -> dict:
         return {"rule": self.rule, "severity": self.severity, "title": self.title, "detail": self.detail,
@@ -451,6 +453,8 @@ def fix_script(findings: list[Finding], device: str) -> str:
              "! Keep a console/second session open while changing vty, ACL or SSH settings.", "configure terminal"]
     seen = set()
     for f in sorted(findings, key=lambda f: SEV_ORDER.get(f.severity, 9)):
+        if f.rule.startswith("flow_"):
+            continue                      # traffic findings are fixed on the hosts, not with router commands
         block = tuple(x for x in f.fix if x != "write memory")
         if not block or block in seen:
             continue

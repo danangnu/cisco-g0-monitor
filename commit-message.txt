@@ -1,7 +1,11 @@
-fix: correct audit advice for PPP CHAP/PAP credentials
+feat: traffic visibility from router NetFlow caches (agent stage 5)
 
-- Report cleartext PPP CHAP/PAP passwords as their own HIGH finding
-- Recommend service password-encryption and CHAP-only instead of "use secret"
-- Report type-7 PPP credentials as an expected LOW finding to review and accept
-- Keep PPP lines out of the generic cleartext and type-7 password findings
-- Release version 1.4.2
+- Read each router's Flexible NetFlow cache over the existing SSH session; nothing is exported
+- Generate the per-router flow record/monitor config with LAN interfaces taken from the config backup
+- Compute deltas between reads and keep hourly rollups in history.db (metadata only)
+- Group reply traffic on temporary ports (32768+) so server responses do not flood the rollups
+- Flag cleartext protocols, internal services leaving the site, large uploads and scanning
+- Track traffic findings in the audit lifecycle with stable identities and their own scope
+- Add traffic to the audit email, the weekly report and Claude's diagnosis context
+- Add --netflow-config, --flows-check and --flows commands
+- Release version 1.5.1

@@ -1268,3 +1268,252 @@ def test_ppp_credentials_get_specific_advice():
     fs7 = audit_mod.audit_config(enc, "rtr-231")
     assert [f.severity for f in fs7 if f.rule == "ppp_credentials"] == ["low"]
     assert not any(f.rule in ("ppp_cleartext", "type7_passwords") for f in fs7)
+
+
+# ---------------- Stage 5: NetFlow cache polling ----------------
+from monitor import flows as flows_mod  # noqa: E402
+
+FLOW_HEAD = """Cache type:                               Normal
+Cache size:                                32768
+Current entries:                               {n}
+High Watermark:                               12
+
+Flows added:                                 120
+Flows aged:                                  116
+  - Active timeout      (604800 secs)          0
+  - Inactive timeout    (   420 secs)        116
+
+IPV4 SRC ADDR,IPV4 DST ADDR,TRNS DST PORT,IP PROT,bytes long,pkts long,time first,time last
+"""
+FLOW_SETTINGS = copy.deepcopy(DEFAULT_SETTINGS)
+FLOW_SETTINGS["flows"]["enabled"] = True
+
+
+def flow_csv(rows):
+    """rows: (src, dst, dport, proto, bytes, pkts[, first])"""
+    body = "\n".join(f"{r[0]},{r[1]},{r[2]},{r[3]},{r[4]},{r[5]},{r[6] if len(r) > 6 else '10:00:00.000'},10:04:00.000" for r in rows)
+    return FLOW_HEAD.format(n=len(rows)) + body + "\n"
+
+
+def fr(src, dst, dport, proto, b, pk=10, first="10:00:00.000"):
+    return flows_mod.FlowRow(src, dst, proto, dport, b, pk, first)
+
+
+def test_flow_csv_parse_and_errors():
+    meta, rows = flows_mod.parse_cache_csv(flow_csv([("192.168.18.20", "8.8.8.8", 53, 17, 300, 4),
+                                                     ("192.168.18.21", "10.0.0.5", 2048, 1, 840, 10),
+                                                     ("192.168.18.22", "203.0.113.9", 23, 6, 5000, 40)]) + "garbage,line\n")
+    assert meta == {"cache_size": 32768, "entries": 3, "high_watermark": 12, "flows_added": 120}
+    assert [(r.src, r.dst, r.proto, r.dport, r.bytes) for r in rows] == [
+        ("192.168.18.20", "8.8.8.8", 17, 53, 300), ("192.168.18.21", "10.0.0.5", 1, 0, 840), ("192.168.18.22", "203.0.113.9", 6, 23, 5000)]
+    # empty cache: monitor exists, no header row
+    assert flows_mod.parse_cache_csv("Cache type: Normal\nCache size: 4096\nCurrent entries: 0\n")[1] == []
+    for bad in ("% Flow Monitor: G0MON not found", "                ^\n% Invalid input detected at '^' marker.", ""):
+        with pytest.raises(flows_mod.FlowNotConfigured):
+            flows_mod.parse_cache_csv(bad)
+    # a record without the fields we need is reported, not mis-parsed
+    with pytest.raises(flows_mod.FlowNotConfigured, match="missing fields"):
+        flows_mod.parse_cache_csv("IPV4 SRC ADDR,IPV4 DST ADDR,bytes\n1.1.1.1,2.2.2.2,5\n")
+
+
+def test_flow_ingest_baseline_deltas_and_recreated_entries(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    t = T0
+    a = ("192.168.18.20", "203.0.113.9", 443, 6)
+    s0 = flows_mod.ingest(h, "r1", [fr(*a, 5_000_000)], t, FLOW_SETTINGS)
+    assert s0["baseline"] and h.conn.execute("SELECT COUNT(*) FROM flow_hourly").fetchone()[0] == 0   # first read counts nothing
+    s1 = flows_mod.ingest(h, "r1", [fr(*a, 8_000_000), fr("192.168.18.21", "8.8.8.8", 53, 17, 400)], t + timedelta(minutes=5), FLOW_SETTINGS)
+    assert not s1["baseline"] and s1["bytes"] == 3_000_000 + 400 and s1["active"] == 2
+    # unchanged entry -> no activity; entry aged out and re-created (new first, smaller counter) -> counted in full
+    s2 = flows_mod.ingest(h, "r1", [fr(*a, 1_000, first="10:11:00.000"), fr("192.168.18.21", "8.8.8.8", 53, 17, 400)],
+                          t + timedelta(minutes=10), FLOW_SETTINGS)
+    assert s2["bytes"] == 1_000 and s2["active"] == 1
+    tot = h.conn.execute("SELECT SUM(bytes) FROM flow_hourly WHERE dst='*'").fetchone()[0]
+    assert tot == 3_000_000 + 400 + 1_000
+    # long gap (monitor was off): re-baseline instead of piling hours of traffic into one hour
+    s3 = flows_mod.ingest(h, "r1", [fr(*a, 9_000_000_000, first="10:11:00.000")], t + timedelta(hours=6), FLOW_SETTINGS)
+    assert s3["baseline"] and h.conn.execute("SELECT SUM(bytes) FROM flow_hourly WHERE dst='*'").fetchone()[0] == tot
+
+
+def test_flow_rollup_keeps_detail_only_where_needed(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    flows_mod.ingest(h, "r1", [], T0, FLOW_SETTINGS)
+    h.set_meta("flow:last_poll:r1", T0.isoformat(timespec="seconds"))
+    rows = [fr("192.168.18.20", f"198.51.100.{i}", 443, 6, 2_000) for i in range(1, 31)]        # 30 small https flows
+    rows += [fr("192.168.18.20", "203.0.113.9", 443, 6, 50_000_000),                            # one big upload
+             fr("192.168.18.30", "192.168.18.1", 23, 6, 900)]                                    # telnet (watched port)
+    flows_mod.ingest(h, "r1", rows, T0 + timedelta(minutes=5), FLOW_SETTINGS)
+    star = {(r["src"], r["dport"]): (r["bytes"], r["dsts"]) for r in h.conn.execute("SELECT * FROM flow_hourly WHERE dst='*'")}
+    assert star[("192.168.18.20", 443)] == (30 * 2_000 + 50_000_000, 31) and star[("192.168.18.30", 23)] == (900, 1)
+    detail = {(r["src"], r["dst"], r["dport"]) for r in h.conn.execute("SELECT * FROM flow_hourly WHERE dst!='*'")}
+    assert detail == {("192.168.18.20", "203.0.113.9", 443), ("192.168.18.30", "192.168.18.1", 23)}
+    assert h.conn.execute("SELECT COUNT(*) FROM flow_hosts").fetchone()[0] == 2
+
+
+def _seed(h, device, now, rows, minutes=5):
+    """Baseline + one poll carrying `rows` as activity at `now`."""
+    flows_mod.ingest(h, device, [], now - timedelta(minutes=minutes), FLOW_SETTINGS)
+    return flows_mod.ingest(h, device, rows, now, FLOW_SETTINGS)
+
+
+def test_flow_findings_rules(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    rows = [fr("192.168.18.30", "192.168.18.1", 23, 6, 900),                 # telnet inside the LAN: still cleartext
+            fr("192.168.18.31", "192.168.18.5", 445, 6, 80_000),             # SMB to an internal server: fine
+            fr("192.168.18.32", "45.33.32.50", 445, 6, 4_000),              # SMB to the internet: not fine
+            fr("192.168.18.33", "52.95.110.7", 443, 6, 6 * 1024 ** 3),      # 6 GB to one internet host
+            fr("192.168.18.34", "192.168.18.22", 3306, 6, 10_000)]           # MySQL to the internal TrackIT DB: fine
+    rows += [fr("192.168.18.40", f"10.9.{i // 250}.{i % 250 + 1}", 22, 6, 120) for i in range(150)]   # ssh to 150 hosts
+    rows += [fr("192.168.18.41", f"198.51.100.{i}", 443, 6, 3_000) for i in range(1, 200)]            # busy browser: not a scan
+    _seed(h, DEV.name, T0, rows)
+    fs = flows_mod.analyse(h, [DEV], T0, FLOW_SETTINGS)[DEV.name]
+    by_rule = {f.rule: f for f in fs}
+    assert set(by_rule) == {"flow_telnet", "flow_smb-external", "flow_upload", "flow_scan"}
+    assert by_rule["flow_telnet"].severity == "high" and "192.168.18.30 -> 192.168.18.1 tcp/23 (telnet)" in by_rule["flow_telnet"].evidence[0]
+    assert "45.33.32.50" in by_rule["flow_smb-external"].evidence[0] and "192.168.18.5" not in " ".join(by_rule["flow_smb-external"].evidence)
+    assert by_rule["flow_upload"].title == "Large upload from 192.168.18.33 to 52.95.110.7" and "6.0 GB" in by_rule["flow_upload"].evidence[0]
+    assert by_rule["flow_scan"].severity == "high" and "192.168.18.40" in by_rule["flow_scan"].title and "150" in by_rule["flow_scan"].evidence[0]
+    # routers without flow data are left out entirely (nothing to resolve for them)
+    assert flows_mod.analyse(h, [Device(**{**DEV.__dict__, "name": "other"})], T0, FLOW_SETTINGS) == {}
+
+
+def test_flow_findings_lifecycle_is_stable_and_scoped(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    n = ReportCapture()
+    telnet = [fr("192.168.18.30", "192.168.18.1", 23, 6, 900)]
+    _seed(h, DEV.name, T0, telnet)
+    r1 = posture_mod.run_audit(h, FLOW_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], T0, notifier=n,
+                               extra=flows_mod.analyse(h, [DEV], T0, FLOW_SETTINGS))
+    assert any(f.rule == "flow_telnet" for f in r1["new"]) and len(n.reports) == 1 and "Telnet in use" in n.reports[0][2]
+    # next day: more telnet (evidence text changes) -> same finding, still open, no new email
+    d2 = T0 + timedelta(days=1)
+    _seed(h, DEV.name, d2, [fr("192.168.18.30", "192.168.18.1", 23, 6, 5_000, first="x")])
+    r2 = posture_mod.run_audit(h, FLOW_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], d2, notifier=n,
+                               extra=flows_mod.analyse(h, [DEV], d2, FLOW_SETTINGS))
+    assert not r2["new"] and any(f.rule == "flow_telnet" for f in r2["open"]) and len(n.reports) == 1
+    ev = json.loads(h.conn.execute("SELECT evidence FROM audit_findings WHERE rule='flow_telnet'").fetchone()[0])
+    assert "2 five-minute interval(s)" in ev[0]                       # evidence refreshed in place
+    # a config-only audit must not close the traffic finding...
+    r3 = posture_mod.run_audit(h, FLOW_SETTINGS, {DEV.name: HARDENED_CFG}, [DEV], d2)
+    assert not any(f.rule == "flow_telnet" for f in r3["resolved"])
+    # ...and a traffic-only pass must not close config findings
+    r4 = posture_mod.run_audit(h, FLOW_SETTINGS, {}, [DEV], d2, extra=flows_mod.analyse(h, [DEV], d2, FLOW_SETTINGS))
+    assert not r4["resolved"] and r4["score"][DEV.name] <= 90         # telnet (high) counts in the score
+    # accepted traffic finding stays accepted; then, after a clean week, it resolves
+    assert posture_mod.accept(h, "all", "Telnet in use", "legacy PLC, isolated VLAN", d2)
+    later = d2 + timedelta(days=8)
+    h.set_meta(f"flow:last_poll:{DEV.name}", later.isoformat(timespec="seconds"))
+    r5 = posture_mod.run_audit(h, FLOW_SETTINGS, {}, [DEV], later, extra=flows_mod.analyse(h, [DEV], later, FLOW_SETTINGS))
+    assert [f.rule for f in r5["resolved"]] == ["flow_telnet"]
+
+
+def test_netflow_config_generation():
+    cfg = """interface GigabitEthernet0/0
+ ip address dhcp
+ ip nat outside
+!
+interface GigabitEthernet0/1
+ ip address 192.168.18.143 255.255.255.0
+ ip nat inside
+!
+interface Vlan1
+ ip address 192.168.50.1 255.255.255.0
+ ip nat inside
+!
+interface Vlan99
+ ip address 10.99.0.1 255.255.255.0
+ shutdown
+!
+interface Loopback0
+ ip address 10.255.0.1 255.255.255.255
+"""
+    lan, how = flows_mod.lan_interfaces_from_config(cfg, "GigabitEthernet0/0")
+    assert lan == ["GigabitEthernet0/1", "Vlan1"] and "nat inside" in how
+    lan2, how2 = flows_mod.lan_interfaces_from_config(cfg.replace(" ip nat inside\n", ""), "GigabitEthernet0/0")
+    assert lan2 == ["GigabitEthernet0/1", "Vlan1"] and "no 'ip nat inside'" in how2
+    text = flows_mod.router_config(DEV, lan, FLOW_SETTINGS)
+    for line in ("flow record G0MON-REC", " match transport destination-port", " collect counter bytes long", "flow monitor G0MON",
+                 " cache timeout inactive 420", " cache timeout active 604800", "interface Vlan1", " ip flow monitor G0MON input"):
+        assert line in text.splitlines(), line
+    assert "flow exporter" not in text and "write memory" in text and "no flow monitor G0MON" in text
+
+
+class FlowRouter:
+    """Fake router: normal check commands via FakeConn, plus a flow cache that grows each read."""
+    reads = 0
+
+    def __init__(self, host, has_monitor=True):
+        self.inner = FakeConn({"show": SHOW_DHCP, "ping": PING_OK, "commands": []})
+        self.has_monitor = has_monitor
+
+    def send_command(self, cmd, read_timeout=None):
+        if cmd.startswith("show flow monitor"):
+            if not self.has_monitor:
+                return "% Flow Monitor: G0MON not found"
+            FlowRouter.reads += 1
+            return flow_csv([("192.168.18.30", "192.168.18.1", 23, 6, 1_000 * FlowRouter.reads, 5 * FlowRouter.reads),
+                             ("192.168.18.20", "203.0.113.9", 443, 6, 2_000_000 * FlowRouter.reads, 900 * FlowRouter.reads)])
+        return self.inner.send_command(cmd, read_timeout)
+
+    def disconnect(self):
+        pass
+
+
+def test_cycle_polls_flows_and_survives_routers_without_a_monitor(tmp_path):
+    FlowRouter.reads = 0
+    devs = [Device(**{**DEV.__dict__, "name": "rtr-143", "host": "192.168.18.143"}),
+            Device(**{**DEV.__dict__, "name": "rtr-145", "host": "192.168.18.145"})]
+    store, notifier, hist = StateStore(str(tmp_path)), CaptureNotifier(), History(str(tmp_path / "history.db"))
+    clock = iter(T0 + timedelta(minutes=5 * i) for i in range(10))
+    connect = lambda d, t: FlowRouter(d.host, has_monitor=(d.name == "rtr-143"))
+    for _ in range(3):
+        run_cycle(devs, FLOW_SETTINGS, store, notifier, connect=connect, now_fn=lambda: next(clock), hist=hist)
+    rows = hist.conn.execute("SELECT device, src, dst, dport, bytes, polls FROM flow_hourly WHERE dst!='*' ORDER BY dport").fetchall()
+    assert [(r["device"], r["dst"], r["dport"], r["bytes"], r["polls"]) for r in rows] == [
+        ("rtr-143", "192.168.18.1", 23, 2_000, 2), ("rtr-143", "203.0.113.9", 443, 4_000_000, 2)]   # read 1 = baseline
+    assert hist.get_meta("flow:unconfigured:rtr-145") and FlowRouter.reads == 3                      # rtr-145 asked once, then left alone
+    t = flows_mod.traffic_summary(hist, "rtr-143", T0 + timedelta(minutes=15))
+    assert t["sent_bytes"] == 4_002_000 and t["hosts"] == 2 and t["top_hosts"][0]["host"] == "192.168.18.20"
+    assert flows_mod.traffic_summary(hist, "rtr-145", T0) is None
+    ctx = hist.summary_for("rtr-143", T0 + timedelta(minutes=15), 30)
+    assert ctx["traffic_last_24h"]["hosts"] == 2 and hist.summary_for("rtr-145", T0, 30)["traffic_last_24h"] is None
+
+
+def test_flows_disabled_by_default_never_touches_the_router(tmp_path):
+    seen = []
+
+    class Spy(FakeConn):
+        def send_command(self, cmd, read_timeout=None):
+            seen.append(cmd)
+            return super().send_command(cmd, read_timeout)
+    store, hist = StateStore(str(tmp_path)), History(str(tmp_path / "history.db"))
+    run_cycle([DEV], DEFAULT_SETTINGS, store, CaptureNotifier(), connect=lambda d, t: Spy({"show": SHOW_DHCP, "ping": PING_OK, "commands": []}),
+              now_fn=lambda: T0, hist=hist)
+    assert not any("flow" in c for c in seen)
+
+
+def test_fix_script_leaves_out_traffic_findings():
+    f = audit_mod.Finding("flow_telnet", "high", "Telnet in use", "d", ["Find the source device"], ["e"], "r1", key="telnet")
+    assert "Find the source device" not in audit_mod.fix_script([f], "r1")
+
+
+def test_flow_not_configured_message_is_useful():
+    raw = "                               ^\n% Invalid input detected at '^' marker.\n"
+    with pytest.raises(flows_mod.FlowNotConfigured) as ei:
+        flows_mod.parse_cache_csv(raw)
+    assert str(ei.value).startswith("% Invalid input detected") and "not applied" in str(ei.value)
+
+
+def test_flow_replies_on_high_ports_are_grouped_and_never_a_scan(tmp_path):
+    h = History(str(tmp_path / "h.db"))
+    # a file/DB server on the shared segment answering 150 PCs, each on its own temporary port
+    rows = [fr("192.168.18.22", f"192.168.209.{i % 250 + 1}", 49152 + i, 6, 2_000_000) for i in range(150)]
+    rows += [fr("192.168.18.29", "192.168.209.3", 55614, 6, 1_500_000), fr("192.168.18.29", "192.168.209.3", 55615, 6, 1_200_000)]
+    _seed(h, DEV.name, T0, rows)
+    star = h.conn.execute("SELECT src, dport, bytes, dsts FROM flow_hourly WHERE dst='*' ORDER BY src").fetchall()
+    assert [(r["src"], r["dport"], r["dsts"]) for r in star] == [("192.168.18.22", 65536, 150), ("192.168.18.29", 65536, 1)]
+    det = h.conn.execute("SELECT src, dst, dport, bytes FROM flow_hourly WHERE dst!='*' AND src='192.168.18.29'").fetchall()
+    assert [(r["dport"], r["bytes"]) for r in det] == [(65536, 2_700_000)]               # two flows merged into one detail row
+    assert flows_mod.analyse(h, [DEV], T0, FLOW_SETTINGS)[DEV.name] == []              # busy server is not a "scan"
+    t = flows_mod.traffic_summary(h, DEV.name, T0)
+    assert t["top_services"][0]["service"] == "tcp/high ports (replies)"

@@ -34,3 +34,8 @@ devices:
     username: ${LAB_USERNAME:-admin}  # per-device credentials override the defaults
     password: ${LAB_PASSWORD}
     enabled: false                    # keep in inventory but don't check
+
+  # NetFlow (Stage 5): `--netflow-config <name>` picks the LAN interfaces from the config backup
+  # ('ip nat inside'). Override per router, or exclude a router from flow collection:
+  #   lan_interfaces: [GigabitEthernet0/1, Vlan10]
+  #   flows: false

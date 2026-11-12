@@ -196,6 +196,7 @@ class History:
             "ping_success_last_24h_percent": self.loss(device, now - timedelta(days=1)),
             "subnet_changes": [{"at": s["started_at"][:16], "detail": s["detail"][:120]} for s in subnet_changes],
             "security_posture": self._posture(device),
+            "traffic_last_24h": self._traffic(device, now),
             "config": None if not cfg else {
                 "last_backup": cfg["ts"][:16], "lines": cfg["lines"],
                 "recent_changes": [{"at": c["ts"][:16], "added": c["added"], "removed": c["removed"]} for c in changes],
@@ -208,6 +209,17 @@ class History:
             from .posture import summary
             p = summary(self, device)
             return p if p.get("score") is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _traffic(self, device: str, now: datetime) -> Optional[dict]:
+        """Compact NetFlow summary (what hosts behind the router sent). None when flows are not collected."""
+        try:
+            from .flows import traffic_summary
+            t = traffic_summary(self, device, now, 24, top=3)
+            if not t:
+                return None
+            return {k: t[k] for k in ("sent", "sent_bytes", "hosts", "top_hosts", "top_services", "peak_hour")}
         except Exception:  # noqa: BLE001
             return None
 
